@@ -19,11 +19,13 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          < NV_6236 >
+# Author List:      < Ayush Tiwari, Anushka Telore , Atharva Jadhav , Utkarsh Singh >
 # Filename:         lane_detection.py
-# Functions:        detect_lane
-# Global variables: < List any global variables you add, "None" if you add none >
+# Functions:        detect_lane, _lane_colour_masks, _remove_border_touching,
+#                    _row_band_clusters
+# Global variables: _LANE_WIDTH_PX_FRAME, _ROW_BAND_HALF_HEIGHT,
+#                    _CENTRE_DEADZONE_PX, _SCAN_ROW_CENTRES
 
 
 ####################### IMPORT MODULES #######################
@@ -77,11 +79,9 @@ def detect_lane(frame):
     dataset's own resolution, 640x480. It is compared against a ground truth
     measured in those pixels, so it only means anything in them.
 
-    You may resize, crop or warp all you like inside this function, but scale
-    the answer back before returning it. A centre found in a 320x240 copy is
-    half the value it should be, and a centre read off a bird's-eye view is in
-    warped coordinates, not frame ones - map the point back through the inverse
-    of your transform. Do not re-encode or resize the clip files themselves.
+    This implementation works directly in the frame's own pixel grid (no
+    resizing/warping), so nothing needs to be scaled or mapped back before
+    returning.
 
     NOTE:
     ---
@@ -89,16 +89,91 @@ def detect_lane(frame):
     Do not call cv2.imshow(), cv2.waitKey(), cv2.imwrite() or print() from
     inside it. All visualisation and debugging output belongs outside this
     function - see draw_overlay() and process_video() below.
+
+    METHOD (see helpers below for details):
+    ---
+    The track has a solid YELLOW line on each outer edge and a dashed WHITE
+    line down the centre. Colour alone tells the two apart, so there is no
+    need to guess which detected line is "the dashed one" - the white mask
+    only ever contains the divider (once the vehicle's own on-screen model
+    and a couple of border-hugging render artefacts are stripped out).
+
+    1. Threshold the frame for white (divider) and yellow (edges).
+    2. Strip any white blob touching the frame border - this removes the
+       vehicle's own chassis/HUD, which is rendered at a fixed screen
+       position and would otherwise look like a lane marking.
+    3. Scan horizontal bands from just above the chassis upward; the first
+       band with a divider pixel becomes the reference row (closest to the
+       vehicle that isn't blocked by its own rendered body).
+    4. Compare the divider's x position to the vehicle's (frame centre) x
+       position to decide "left"/"right", then take the midpoint of the
+       divider and the nearest yellow edge on that side as the lane centre.
     '''
 
     center_x = -1
     lane = LANE_UNKNOWN
 
     #################### ADD YOUR CODE HERE ####################
-    # 1. Isolate the lane markings in `frame`
-    # 2. Work out which two markings bracket the vehicle
-    # 3. Compute the x-pixel of the lane centre   ->  center_x
-    # 4. Decide which lane the vehicle is in      ->  lane
+    try:
+        height, width = frame.shape[:2]
+        vehicle_x = width / 2.0
+
+        white_mask, yellow_mask = _lane_colour_masks(frame)
+
+        divider_x = None
+        left_edge_x = None
+        right_edge_x = None
+
+        for y_center in _SCAN_ROW_CENTRES:
+            if y_center - _ROW_BAND_HALF_HEIGHT < 0:
+                break
+
+            white_clusters = _row_band_clusters(white_mask, y_center, _ROW_BAND_HALF_HEIGHT)
+            if not white_clusters:
+                continue
+
+            # Several small artefacts can occasionally survive the cleanup;
+            # the real divider is the one closest to the vehicle's own
+            # position, since it runs down the middle of the track.
+            divider_x = min(white_clusters, key=lambda x: abs(x - vehicle_x))
+
+            yellow_clusters = _row_band_clusters(yellow_mask, y_center, _ROW_BAND_HALF_HEIGHT)
+            left_candidates = [x for x in yellow_clusters if x < divider_x]
+            right_candidates = [x for x in yellow_clusters if x > divider_x]
+            left_edge_x = max(left_candidates) if left_candidates else None
+            right_edge_x = min(right_candidates) if right_candidates else None
+            break
+
+        if divider_x is None:
+            return {"center_x": -1, "lane": LANE_UNKNOWN}
+
+        # Divider is (numerically) right where the vehicle is - too
+        # ambiguous to call a side confidently.
+        if abs(divider_x - vehicle_x) < _CENTRE_DEADZONE_PX:
+            return {"center_x": -1, "lane": LANE_UNKNOWN}
+
+        if divider_x > vehicle_x:
+            # Divider to the right of the vehicle -> left lane.
+            lane = LANE_LEFT
+            outer_x = left_edge_x
+        else:
+            # Divider to the left of the vehicle -> right lane.
+            lane = LANE_RIGHT
+            outer_x = right_edge_x
+
+        if outer_x is None:
+            # Outer edge wasn't detected on this frame (e.g. it left the
+            # frame on a curve) - fall back on the approximate lane width
+            # stated in the task spec.
+            outer_x = (divider_x - _LANE_WIDTH_PX_FRAME if lane == LANE_LEFT
+                       else divider_x + _LANE_WIDTH_PX_FRAME)
+
+        center_x = int(round((divider_x + outer_x) / 2.0))
+        center_x = max(0, min(width - 1, center_x))
+    except Exception:
+        # Any unexpected failure is reported honestly rather than guessed.
+        center_x = -1
+        lane = LANE_UNKNOWN
     ############################################################
 
     return {"center_x": center_x, "lane": lane}
@@ -111,6 +186,95 @@ def detect_lane(frame):
 # ever calls that one function. List them in the file header too.
 # ------------------------------------------------------------------
 
+_LANE_WIDTH_PX_FRAME = 315   # approx. lane width in frame pixels (from task spec) - fallback only
+_ROW_BAND_HALF_HEIGHT = 15   # half-height (px) of each horizontal scan band
+_CENTRE_DEADZONE_PX = 3      # divider within this many px of vehicle x -> unknown
+_MIN_CLUSTER_WEIGHT = 15     # a real dash/edge spans many columns and rows; a
+                             # single anti-aliasing pixel at a colour boundary
+                             # does not - this discards the latter
+# Scan bands from just above the vehicle's own on-screen model upward.
+_SCAN_ROW_CENTRES = list(range(465, 130, -30))
+
+
+def _lane_colour_masks(frame):
+    '''
+    Threshold `frame` for the track's two marking colours - solid yellow
+    edges and dashed white centre divider - and remove render artefacts
+    that would otherwise be mistaken for the divider.
+    '''
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    white_mask = cv2.inRange(hsv, (0, 0, 200), (180, 40, 255))
+    yellow_mask = cv2.inRange(hsv, (15, 100, 100), (35, 255, 255))
+
+    # The vehicle's own chassis/HUD (light grey/white, fixed screen
+    # position) and a couple of thin render artefacts along the track's
+    # curb all touch a frame border; the dashed divider never does. This
+    # is a cheap, robust way to drop all of them at once.
+    white_mask = _remove_border_touching(white_mask)
+
+    return white_mask, yellow_mask
+
+
+def _remove_border_touching(mask):
+    '''
+    Remove every connected white blob that touches any edge of the frame.
+    '''
+    height, width = mask.shape
+    num_labels, labels = cv2.connectedComponents((mask > 0).astype(np.uint8))[:2]
+    if num_labels <= 1:
+        return mask
+
+    border_labels = set(np.unique(labels[0, :]))
+    border_labels |= set(np.unique(labels[-1, :]))
+    border_labels |= set(np.unique(labels[:, 0]))
+    border_labels |= set(np.unique(labels[:, -1]))
+    border_labels.discard(0)
+
+    if not border_labels:
+        return mask
+
+    cleaned = mask.copy()
+    cleaned[np.isin(labels, list(border_labels))] = 0
+    return cleaned
+
+
+def _row_band_clusters(mask, y_center, half_height):
+    '''
+    Sum a binary mask over a horizontal band of rows and collapse the
+    result into one weighted-centroid x-position per contiguous run of
+    lit columns - each run is one candidate marking in that band.
+
+    Runs lighter than `_MIN_CLUSTER_WEIGHT` are discarded: a real dash or
+    edge segment spans many columns and rows within the band, whereas a
+    single anti-aliasing pixel at a colour boundary (e.g. where the yellow
+    edge meets the black road) only ever lights up a column or two. This
+    keeps such artefacts from ever being mistaken for the divider.
+    '''
+    height, width = mask.shape
+    y_low = max(0, y_center - half_height)
+    y_high = min(height, y_center + half_height)
+
+    column_counts = np.sum(mask[y_low:y_high, :] > 0, axis=0).astype(np.float32)
+
+    clusters = []
+    in_run = False
+    run_start = 0
+    for x in range(width + 1):
+        value = column_counts[x] if x < width else 0.0
+        above = value > 0
+        if above and not in_run:
+            in_run = True
+            run_start = x
+        elif not above and in_run:
+            in_run = False
+            xs = np.arange(run_start, x)
+            weights = column_counts[run_start:x]
+            total = weights.sum()
+            if total >= _MIN_CLUSTER_WEIGHT:
+                clusters.append(float((xs * weights).sum() / total))
+
+    return clusters
 
 ##############################################################
 ################ END OF YOUR IMPLEMENTATION ##################

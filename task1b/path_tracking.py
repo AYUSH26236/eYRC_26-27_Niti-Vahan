@@ -19,8 +19,8 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          < NV_6236 >
+# Author List:      < Ayush Tiwari , Anushka Telore , Atharva Jadhav , utkarssh singh >
 # Filename:         path_tracking.py
 # Functions:        ackermann_wheel_angles, compute_steering
 
@@ -66,11 +66,53 @@ def ackermann_wheel_angles(delta):
     `left_wheel_angle`  : [ float ]  angle for the left front wheel, radians
     `right_wheel_angle` : [ float ]  angle for the right front wheel, radians
     '''
+ # When there is no steering, both wheels remain straight
 
-    left_wheel_angle = 0
-    right_wheel_angle = 0
+    if abs(delta) < 1e-9:
 
-    return left_wheel_angle, right_wheel_angle
+        return 0.0, 0.0
+
+    # Half of the track width, including the wheel offset
+
+    half_track = TRACK_WIDTH / 2.0 - WHEEL_OFFSET
+
+    # Radius of the path followed by the virtual centre wheel
+
+    radius = WHEELBASE / math.tan(abs(delta))
+
+    # Angle of the inside wheel
+
+    inside_angle = math.atan(
+
+        WHEELBASE / (radius - half_track)
+
+    )
+
+    # Angle of the outside wheel
+
+    outside_angle = math.atan(
+
+        WHEELBASE / (radius + half_track)
+
+    )
+
+    # Positive delta means turning left
+
+    if delta > 0:
+
+        left_angle = inside_angle
+
+        right_angle = outside_angle
+
+    # Negative delta means turning right
+
+    else:
+
+        left_angle = -outside_angle
+
+        right_angle = -inside_angle
+
+    return left_angle, right_angle
 
 
 def compute_steering(target_y, current_values):
@@ -110,7 +152,59 @@ def compute_steering(target_y, current_values):
     no commanding the simulator - the control loop below does all of that.
     '''
 
-    steering = 0
+   # ---- PID state, persists between calls to compute_steering() ----
+
+_pid_integral = 0.0
+
+_pid_prev_error = 0.0
+
+
+# ---- PID gains - starting guesses, tune against trajectory.csv ----
+
+KP_Y = 7
+
+KI_Y = 0.05
+
+KD_Y = 6
+
+
+
+def compute_steering(target_y, current_values):
+
+    global _pid_integral, _pid_prev_error
+
+    y = current_values["y"]
+
+    yaw = current_values["yaw"]
+
+    dt = current_values["dt"]
+
+    # Cross-track error: positive means too far toward +y, asks for a left turn
+
+    error_y = y - target_y
+
+    # Heading error, per the spec - negative of yaw
+
+    error_yaw = -yaw
+
+    # Integral term - accumulates across lane changes, on purpose. No reset here.
+
+    _pid_integral += error_y * dt
+
+    # Derivative term - rate of change of the cross-track error
+
+    if dt > 0.0:
+
+        derivative = (error_y - _pid_prev_error) / dt
+
+    else:
+
+        derivative = 0.0
+
+    _pid_prev_error = error_y
+
+    steering = KP_Y * error_y + KI_Y * _pid_integral + KD_Y * derivative + error_yaw
+
     return steering
 
 
