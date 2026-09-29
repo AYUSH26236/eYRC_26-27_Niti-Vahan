@@ -79,9 +79,11 @@ def detect_lane(frame):
     dataset's own resolution, 640x480. It is compared against a ground truth
     measured in those pixels, so it only means anything in them.
 
-    This implementation works directly in the frame's own pixel grid (no
-    resizing/warping), so nothing needs to be scaled or mapped back before
-    returning.
+    You may resize, crop or warp all you like inside this function, but scale
+    the answer back before returning it. A centre found in a 320x240 copy is
+    half the value it should be, and a centre read off a bird's-eye view is in
+    warped coordinates, not frame ones - map the point back through the inverse
+    of your transform. Do not re-encode or resize the clip files themselves.
 
     NOTE:
     ---
@@ -89,25 +91,6 @@ def detect_lane(frame):
     Do not call cv2.imshow(), cv2.waitKey(), cv2.imwrite() or print() from
     inside it. All visualisation and debugging output belongs outside this
     function - see draw_overlay() and process_video() below.
-
-    METHOD (see helpers below for details):
-    ---
-    The track has a solid YELLOW line on each outer edge and a dashed WHITE
-    line down the centre. Colour alone tells the two apart, so there is no
-    need to guess which detected line is "the dashed one" - the white mask
-    only ever contains the divider (once the vehicle's own on-screen model
-    and a couple of border-hugging render artefacts are stripped out).
-
-    1. Threshold the frame for white (divider) and yellow (edges).
-    2. Strip any white blob touching the frame border - this removes the
-       vehicle's own chassis/HUD, which is rendered at a fixed screen
-       position and would otherwise look like a lane marking.
-    3. Scan horizontal bands from just above the chassis upward; the first
-       band with a divider pixel becomes the reference row (closest to the
-       vehicle that isn't blocked by its own rendered body).
-    4. Compare the divider's x position to the vehicle's (frame centre) x
-       position to decide "left"/"right", then take the midpoint of the
-       divider and the nearest yellow edge on that side as the lane centre.
     '''
 
     center_x = -1
@@ -188,12 +171,9 @@ def detect_lane(frame):
 
 _LANE_WIDTH_PX_FRAME = 315   # approx. lane width in frame pixels (from task spec) - fallback only
 _ROW_BAND_HALF_HEIGHT = 15   # half-height (px) of each horizontal scan band
-_CENTRE_DEADZONE_PX = 3      # divider within this many px of vehicle x -> unknown
-_MIN_CLUSTER_WEIGHT = 15     # a real dash/edge spans many columns and rows; a
-                             # single anti-aliasing pixel at a colour boundary
-                             # does not - this discards the latter
+_CENTRE_DEADZONE_PX = 0      # divider within this many px of vehicle x -> unknown
 # Scan bands from just above the vehicle's own on-screen model upward.
-_SCAN_ROW_CENTRES = list(range(465, 130, -30))
+_SCAN_ROW_CENTRES = list(range(300, 120, -30))
 
 
 def _lane_colour_masks(frame):
@@ -244,12 +224,6 @@ def _row_band_clusters(mask, y_center, half_height):
     Sum a binary mask over a horizontal band of rows and collapse the
     result into one weighted-centroid x-position per contiguous run of
     lit columns - each run is one candidate marking in that band.
-
-    Runs lighter than `_MIN_CLUSTER_WEIGHT` are discarded: a real dash or
-    edge segment spans many columns and rows within the band, whereas a
-    single anti-aliasing pixel at a colour boundary (e.g. where the yellow
-    edge meets the black road) only ever lights up a column or two. This
-    keeps such artefacts from ever being mistaken for the divider.
     '''
     height, width = mask.shape
     y_low = max(0, y_center - half_height)
@@ -271,7 +245,7 @@ def _row_band_clusters(mask, y_center, half_height):
             xs = np.arange(run_start, x)
             weights = column_counts[run_start:x]
             total = weights.sum()
-            if total >= _MIN_CLUSTER_WEIGHT:
+            if total > 0:
                 clusters.append(float((xs * weights).sum() / total))
 
     return clusters
