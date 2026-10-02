@@ -22,10 +22,13 @@
 # Team ID:          < NV_6236 >
 # Author List:      < Ayush Tiwari, Anushka Telore , Atharva Jadhav , Utkarsh Singh >
 # Filename:         lane_detection.py
-# Functions:        detect_lane, _lane_colour_masks, _remove_border_touching,
-#                    _row_band_clusters
+# Functions:        detect_lane, _x_at_reference_row, _lane_colour_masks,
+#                    _remove_border_touching, _row_band_clusters
 # Global variables: _LANE_WIDTH_PX_FRAME, _ROW_BAND_HALF_HEIGHT,
-#                    _CENTRE_DEADZONE_PX, _SCAN_ROW_CENTRES
+#                    _CENTRE_DEADZONE_PX, _SCAN_ROW_CENTRES, _REF_ROW,
+#                    _ROAD_SPAN_MIN, _ROAD_SPAN_MAX, _LANE_WIDTH_MIN,
+#                    _LANE_WIDTH_MAX, _MAX_HOLD_FRAMES, _BORDER_KEEP_MAX_WIDTH,
+#                    _last_good, _hold_count, _lane_width_est
 
 
 ####################### IMPORT MODULES #######################
@@ -97,15 +100,17 @@ def detect_lane(frame):
     lane = LANE_UNKNOWN
 
     #################### ADD YOUR CODE HERE ####################
+    global _last_good, _hold_count, _lane_width_est
     try:
         height, width = frame.shape[:2]
         vehicle_x = width / 2.0
 
         white_mask, yellow_mask = _lane_colour_masks(frame)
 
-        divider_x = None
-        left_edge_x = None
-        right_edge_x = None
+        # Collect (row, x) samples from every scan band instead of stopping
+        # at the first band that has white. Dashes have gaps, so a single
+        # band is unreliable; a line fitted through several is not.
+        divider_pts, left_pts, right_pts = [], [], []
 
         for y_center in _SCAN_ROW_CENTRES:
             if y_center - _ROW_BAND_HALF_HEIGHT < 0:
@@ -114,47 +119,64 @@ def detect_lane(frame):
             white_clusters = _row_band_clusters(white_mask, y_center, _ROW_BAND_HALF_HEIGHT)
             if not white_clusters:
                 continue
-
-            # Several small artefacts can occasionally survive the cleanup;
-            # the real divider is the one closest to the vehicle's own
-            # position, since it runs down the middle of the track.
-            divider_x = min(white_clusters, key=lambda x: abs(x - vehicle_x))
-
             yellow_clusters = _row_band_clusters(yellow_mask, y_center, _ROW_BAND_HALF_HEIGHT)
-            left_candidates = [x for x in yellow_clusters if x < divider_x]
-            right_candidates = [x for x in yellow_clusters if x > divider_x]
-            left_edge_x = max(left_candidates) if left_candidates else None
-            right_edge_x = min(right_candidates) if right_candidates else None
-            break
+
+            # If both yellow road edges are visible, the divider must sit
+            # about halfway between them - use that to reject false whites.
+            target_x = vehicle_x
+            if len(yellow_clusters) >= 2:
+                span = max(yellow_clusters) - min(yellow_clusters)
+                if _ROAD_SPAN_MIN <= span <= _ROAD_SPAN_MAX:
+                    target_x = (max(yellow_clusters) + min(yellow_clusters)) / 2.0
+
+            d = min(white_clusters, key=lambda x: abs(x - target_x))
+            divider_pts.append((y_center, d))
+
+            lefts = [x for x in yellow_clusters if x < d]
+            rights = [x for x in yellow_clusters if x > d]
+            if lefts:
+                left_pts.append((y_center, max(lefts)))
+            if rights:
+                right_pts.append((y_center, min(rights)))
+
+        divider_x = _x_at_reference_row(divider_pts)
+        left_edge_x = _x_at_reference_row(left_pts)
+        right_edge_x = _x_at_reference_row(right_pts)
 
         if divider_x is None:
+            # Divider not visible (dash gap). Reuse the last good answer
+            # for a few frames rather than returning a guaranteed miss.
+            if _last_good is not None and _hold_count < _MAX_HOLD_FRAMES:
+                _hold_count += 1
+                return dict(_last_good)
             return {"center_x": -1, "lane": LANE_UNKNOWN}
 
-        # Divider is (numerically) right where the vehicle is - too
-        # ambiguous to call a side confidently.
         if abs(divider_x - vehicle_x) < _CENTRE_DEADZONE_PX:
             return {"center_x": -1, "lane": LANE_UNKNOWN}
 
+        # Learn the real lane width whenever both edges are visible.
+        if left_edge_x is not None and right_edge_x is not None:
+            w = (right_edge_x - left_edge_x) / 2.0
+            if _LANE_WIDTH_MIN <= w <= _LANE_WIDTH_MAX:
+                _lane_width_est = 0.8 * _lane_width_est + 0.2 * w
+
         if divider_x > vehicle_x:
-            # Divider to the right of the vehicle -> left lane.
             lane = LANE_LEFT
             outer_x = left_edge_x
         else:
-            # Divider to the left of the vehicle -> right lane.
             lane = LANE_RIGHT
             outer_x = right_edge_x
 
         if outer_x is None:
-            # Outer edge wasn't detected on this frame (e.g. it left the
-            # frame on a curve) - fall back on the approximate lane width
-            # stated in the task spec.
-            outer_x = (divider_x - _LANE_WIDTH_PX_FRAME if lane == LANE_LEFT
-                       else divider_x + _LANE_WIDTH_PX_FRAME)
+            outer_x = (divider_x - _lane_width_est if lane == LANE_LEFT
+                       else divider_x + _lane_width_est)
 
         center_x = int(round((divider_x + outer_x) / 2.0))
         center_x = max(0, min(width - 1, center_x))
+
+        _last_good = {"center_x": center_x, "lane": lane}
+        _hold_count = 0
     except Exception:
-        # Any unexpected failure is reported honestly rather than guessed.
         center_x = -1
         lane = LANE_UNKNOWN
     ############################################################
@@ -169,11 +191,52 @@ def detect_lane(frame):
 # ever calls that one function. List them in the file header too.
 # ------------------------------------------------------------------
 
-_LANE_WIDTH_PX_FRAME = 315   # approx. lane width in frame pixels (from task spec) - fallback only
+_LANE_WIDTH_PX_FRAME = 315   # approx. lane width in frame pixels (from task spec) - initial value
 _ROW_BAND_HALF_HEIGHT = 15   # half-height (px) of each horizontal scan band
 _CENTRE_DEADZONE_PX = 0      # divider within this many px of vehicle x -> unknown
-# Scan bands from just above the vehicle's own on-screen model upward.
 _SCAN_ROW_CENTRES = list(range(300, 120, -30))
+_REF_ROW = 300               # all x-positions are read off at this row
+_ROAD_SPAN_MIN = 450         # plausible distance between the two yellow edges
+_ROAD_SPAN_MAX = 800
+_LANE_WIDTH_MIN = 220
+_LANE_WIDTH_MAX = 420
+_MAX_HOLD_FRAMES = 5         # reuse last good result for at most this many frames
+_BORDER_KEEP_MAX_WIDTH = 50  # a bottom/top-touching blob this narrow is a divider dash
+
+# State carried between frames (frames are processed in order).
+_last_good = None
+_hold_count = 0
+_lane_width_est = float(_LANE_WIDTH_PX_FRAME)
+
+
+def _x_at_reference_row(points):
+    '''
+    Given (row, x) samples, return the x at _REF_ROW. One sample is used as
+    is; several are fitted with a line (one outlier dropped) so dash gaps and
+    perspective drift do not move the answer.
+    '''
+    if not points:
+        return None
+    if len(points) == 1:
+        return float(points[0][1])
+
+    ys = np.array([p[0] for p in points], dtype=np.float64)
+    xs = np.array([p[1] for p in points], dtype=np.float64)
+    nearest = float(xs[np.argmin(np.abs(ys - _REF_ROW))])
+
+    try:
+        slope, intercept = np.polyfit(ys, xs, 1)
+        if len(points) >= 3:
+            resid = np.abs(xs - (slope * ys + intercept))
+            worst = int(np.argmax(resid))
+            if resid[worst] > 20:
+                keep = np.arange(len(xs)) != worst
+                slope, intercept = np.polyfit(ys[keep], xs[keep], 1)
+        if abs(slope) > 1.5:
+            return nearest
+        return float(slope * _REF_ROW + intercept)
+    except Exception:
+        return nearest
 
 
 def _lane_colour_masks(frame):
@@ -187,35 +250,31 @@ def _lane_colour_masks(frame):
     white_mask = cv2.inRange(hsv, (0, 0, 200), (180, 40, 255))
     yellow_mask = cv2.inRange(hsv, (15, 100, 100), (35, 255, 255))
 
-    # The vehicle's own chassis/HUD (light grey/white, fixed screen
-    # position) and a couple of thin render artefacts along the track's
-    # curb all touch a frame border; the dashed divider never does. This
-    # is a cheap, robust way to drop all of them at once.
     white_mask = _remove_border_touching(white_mask)
-
     return white_mask, yellow_mask
 
 
 def _remove_border_touching(mask):
     '''
-    Remove every connected white blob that touches any edge of the frame.
+    Remove white blobs that touch the frame edge (vehicle chassis/HUD, curb
+    artefacts) - EXCEPT narrow blobs touching only the top or bottom edge,
+    which are divider dashes running off the frame and must be kept.
     '''
     height, width = mask.shape
-    num_labels, labels = cv2.connectedComponents((mask > 0).astype(np.uint8))[:2]
-    if num_labels <= 1:
-        return mask
-
-    border_labels = set(np.unique(labels[0, :]))
-    border_labels |= set(np.unique(labels[-1, :]))
-    border_labels |= set(np.unique(labels[:, 0]))
-    border_labels |= set(np.unique(labels[:, -1]))
-    border_labels.discard(0)
-
-    if not border_labels:
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8))
+    if n <= 1:
         return mask
 
     cleaned = mask.copy()
-    cleaned[np.isin(labels, list(border_labels))] = 0
+    for i in range(1, n):
+        x, y, w, h, _area = stats[i]
+        touches_side = (x <= 0) or (x + w >= width)
+        touches_tb = (y <= 0) or (y + h >= height)
+        if not (touches_side or touches_tb):
+            continue
+        if touches_tb and not touches_side and w <= _BORDER_KEEP_MAX_WIDTH:
+            continue
+        cleaned[labels == i] = 0
     return cleaned
 
 
