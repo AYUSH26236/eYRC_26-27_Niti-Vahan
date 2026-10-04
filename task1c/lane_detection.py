@@ -22,20 +22,25 @@
 # Team ID:          < NV_6236 >
 # Author List:      < Ayush Tiwari, Anushka Telore , Atharva Jadhav , Utkarsh Singh >
 # Filename:         lane_detection.py
-# Functions:        detect_lane, _collect_marking_samples,
-#                    _pick_lane_and_outer_edge, _lane_centre,
-#                    _x_at_reference_row, _lane_colour_masks,
-#                    _remove_border_touching, _roi_mask, _row_band_clusters,
-#                    _FrameMemory (class: remember, reuse_last_good, update_lane_width)
+# Functions:        detect_lane, _lane_colour_masks, _find_dashes, _fit_divider,
+#                    _collect_edge_samples, _lane_result, _lane_from_road_edges,
+#                    _x_at_reference_row, _row_band_clusters,
+#                    _DividerFit (class: x_at, confident),
+#                    _FrameMemory (class: reset_tracking, start_frame, remember,
+#                                  reuse_last_good, update_lane_width)
 # Global variables: _WHITE_HSV_LOW, _WHITE_HSV_HIGH, _YELLOW_HSV_LOW,
-#                    _YELLOW_HSV_HIGH, _SCAN_ROW_START, _SCAN_ROW_STOP,
-#                    _SCAN_ROW_STEP, _SCAN_ROW_CENTRES, _ROW_BAND_HALF_HEIGHT,
-#                    _REF_ROW, _INITIAL_LANE_WIDTH_PX, _LANE_WIDTH_MIN,
-#                    _LANE_WIDTH_MAX, _LANE_WIDTH_SMOOTHING, _ROAD_SPAN_MIN,
-#                    _ROAD_SPAN_MAX, _BORDER_KEEP_MAX_WIDTH, _FIT_OUTLIER_PX,
-#                    _FIT_MAX_SLOPE, _CENTRE_DEADZONE_PX, _MAX_HOLD_FRAMES,
-#                    _USE_ROI_MASK, _ROI_BOTTOM_WIDTH, _ROI_TOP_WIDTH, _ROI_TOP_ROW,
-#                    _roi_cache, _OFFSET_LEFT_LANE_PX, _OFFSET_RIGHT_LANE_PX, _memory
+#                    _YELLOW_HSV_HIGH, _DARK_V_MAX, _CAR_BOX, _SCAN_ROW_START,
+#                    _SCAN_ROW_STOP, _SCAN_ROW_STEP, _SCAN_ROW_CENTRES,
+#                    _ROW_BAND_HALF_HEIGHT, _REF_ROW, _DASH_MIN_AREA,
+#                    _DASH_MAX_AREA, _DASH_MAX_WIDTH, _RING_PX,
+#                    _MIN_ASPHALT_FRACTION, _LONE_DASH_MAX_ROW_GAP,
+#                    _FIT_MAX_REJECTIONS, _FIT_OUTLIER_PX, _FIT_MAX_PIXELS,
+#                    _QUAD_MIN_SPAN, _MAX_EXTRAPOLATION, _CONFIDENT_MIN_DASHES,
+#                    _CONFIDENT_MIN_PIXELS, _INITIAL_LANE_WIDTH_PX,
+#                    _LANE_WIDTH_MIN, _LANE_WIDTH_MAX, _LANE_WIDTH_SMOOTHING,
+#                    _ROAD_SPAN_MIN, _ROAD_SPAN_MAX, _EDGE_FIT_OUTLIER_PX,
+#                    _EDGE_FIT_MAX_SLOPE, _MAX_HOLD_FRAMES,
+#                    _SCENE_CUT_THRESHOLD, _RAISE_ERRORS, _memory
 
 
 ####################### IMPORT MODULES #######################
@@ -109,34 +114,35 @@ def detect_lane(frame):
     #################### ADD YOUR CODE HERE ####################
     try:
         width = frame.shape[1]
-        vehicle_x = width / 2.0
+        _memory.start_frame(frame)
 
-        # 1. Find the coloured markings (white divider, yellow road edges).
-        white_mask, yellow_mask = _lane_colour_masks(frame)
+        # 1. Colour masks: white divider, yellow road edges, dark asphalt.
+        white_mask, yellow_mask, dark_mask = _lane_colour_masks(frame)
 
-        # 2. Sample them in several row bands and read each marking's x at
-        #    one fixed reference row.
-        divider_pts, left_pts, right_pts = _collect_marking_samples(
-            white_mask, yellow_mask, vehicle_x)
-        divider_x = _x_at_reference_row(divider_pts)
+        # 2. Divider = the white dashes that sit on asphalt, fitted with one
+        #    polynomial x = f(y) through their pixels.
+        divider = _fit_divider(_find_dashes(white_mask, dark_mask))
+
+        # 3. Road edges (yellow), read at the same reference row.
+        left_pts, right_pts = _collect_edge_samples(yellow_mask, divider)
         left_edge_x = _x_at_reference_row(left_pts)
         right_edge_x = _x_at_reference_row(right_pts)
 
-        # 3. No divider (dash gap): reuse the last good answer briefly.
-        if divider_x is None:
-            return _memory.reuse_last_good()
+        if divider is not None:
+            result = _lane_result(divider.x_at(_REF_ROW), left_edge_x, right_edge_x, width)
+            if divider.confident:
+                _memory.remember(result)
+        else:
+            # No usable divider (dash gap): rebuild it from the road edges,
+            # else reuse the last confident result for a few frames.
+            result = _lane_from_road_edges(left_edge_x, right_edge_x, width)
+            if result is None:
+                result = _memory.reuse_last_good()
 
-        if abs(divider_x - vehicle_x) < _CENTRE_DEADZONE_PX:
-            return {"center_x": -1, "lane": LANE_UNKNOWN}
-
-        # 4. Decide the lane and compute its centre.
-        _memory.update_lane_width(left_edge_x, right_edge_x)
-        lane, outer_x = _pick_lane_and_outer_edge(
-            divider_x, vehicle_x, left_edge_x, right_edge_x)
-        center_x = _lane_centre(divider_x, outer_x, lane, width)
-
-        _memory.remember({"center_x": center_x, "lane": lane})
+        center_x, lane = result["center_x"], result["lane"]
     except Exception:
+        if _RAISE_ERRORS:
+            raise
         center_x = -1
         lane = LANE_UNKNOWN
     ############################################################
@@ -156,6 +162,10 @@ _WHITE_HSV_LOW = (0, 0, 200)         # dashed centre divider: bright, unsaturate
 _WHITE_HSV_HIGH = (180, 40, 255)
 _YELLOW_HSV_LOW = (15, 100, 100)     # solid road edges
 _YELLOW_HSV_HIGH = (35, 255, 255)
+_DARK_V_MAX = 50                     # asphalt is very dark (V about 20)
+
+# ----- The vehicle's own chassis is always white at the bottom of the frame -----
+_CAR_BOX = (225, 425, 415, 480)      # x0, y0, x1, y1
 
 # ----- Where to look -----
 _SCAN_ROW_START = 300                # first (lowest) band centre row
@@ -165,6 +175,23 @@ _SCAN_ROW_CENTRES = list(range(_SCAN_ROW_START, _SCAN_ROW_STOP, -_SCAN_ROW_STEP)
 _ROW_BAND_HALF_HEIGHT = 15           # half-height (px) of each horizontal band
 _REF_ROW = 300                       # every x-position is read off at this row
 
+# ----- Is a white blob a divider dash? -----
+_DASH_MIN_AREA = 8                   # px; smaller is noise
+_DASH_MAX_AREA = 12000               # px; larger is not a dash
+_DASH_MAX_WIDTH = 160                # px
+_RING_PX = 10                        # look this far around a blob for asphalt
+_MIN_ASPHALT_FRACTION = 0.6          # share of the surrounding ring that must be dark
+_LONE_DASH_MAX_ROW_GAP = 60          # a single dash must be this close to the reference row
+
+# ----- Divider polynomial fit -----
+_FIT_MAX_REJECTIONS = 2              # dashes dropped as outliers
+_FIT_OUTLIER_PX = 30                 # a dash further than this from the line is dropped
+_FIT_MAX_PIXELS = 800                # subsample pixels above this many
+_QUAD_MIN_SPAN = 150                 # rows the dashes must span before a curve is fitted
+_MAX_EXTRAPOLATION = 80              # rows a fit may be extended beyond its data
+_CONFIDENT_MIN_DASHES = 2            # a divider fit with this many dashes is trusted ...
+_CONFIDENT_MIN_PIXELS = 150          # ... or with this many pixels
+
 # ----- Geometry sanity limits (px, 640x480 frame) -----
 _INITIAL_LANE_WIDTH_PX = 315         # starting lane width until measured
 _LANE_WIDTH_MIN = 220                # accepted range for a measured lane width
@@ -172,36 +199,57 @@ _LANE_WIDTH_MAX = 420
 _LANE_WIDTH_SMOOTHING = 0.2          # weight of each new lane-width measurement
 _ROAD_SPAN_MIN = 450                 # plausible distance between both yellow edges
 _ROAD_SPAN_MAX = 800
-_BORDER_KEEP_MAX_WIDTH = 50          # top/bottom-touching blob this narrow = divider dash
+_EDGE_FIT_OUTLIER_PX = 20            # road-edge samples further than this are dropped
+_EDGE_FIT_MAX_SLOPE = 1.5            # steeper edge fits are rejected as unreliable
 
-# ----- Line fitting -----
-_FIT_OUTLIER_PX = 20                 # drop one sample further than this from the fit
-_FIT_MAX_SLOPE = 1.5                 # steeper fits are rejected as unreliable
+# ----- Between-frame behaviour -----
+_MAX_HOLD_FRAMES = 5                 # reuse last confident result for at most this many frames
+_SCENE_CUT_THRESHOLD = 12.0          # mean pixel change (16x12 thumbnail) that means a new scene
 
-# ----- Optional trapezoid region of interest (white divider only) -----
-_USE_ROI_MASK = True                # False = behaviour unchanged
-_ROI_BOTTOM_WIDTH = 1.00             # trapezoid width at the bottom row, fraction of frame width
-_ROI_TOP_WIDTH = 0.70                # trapezoid width at its top row, fraction of frame width
-_ROI_TOP_ROW = 100                   # rows above this are ignored (scan bands start near 105)
+# ----- Debugging -----
+_RAISE_ERRORS = False                # True = let errors surface instead of returning "unknown"
 
-# ----- Decision tuning -----
-_CENTRE_DEADZONE_PX = 0              # divider this close to vehicle x -> unknown
-_MAX_HOLD_FRAMES = 5                 # reuse last good result for at most this many frames
-_OFFSET_LEFT_LANE_PX = 0             # bias correction added to center_x, left lane
-_OFFSET_RIGHT_LANE_PX = 0            # bias correction added to center_x, right lane
+
+class _DividerFit:
+    '''The divider as a polynomial x = f(y), plus how much evidence supports it.'''
+
+    def __init__(self, coeffs, n_dashes, n_pixels):
+        self.coeffs = coeffs
+        self.n_dashes = n_dashes
+        self.n_pixels = n_pixels
+
+    def x_at(self, row):
+        return float(np.polyval(self.coeffs, row))
+
+    @property
+    def confident(self):
+        return (self.n_dashes >= _CONFIDENT_MIN_DASHES
+                or self.n_pixels >= _CONFIDENT_MIN_PIXELS)
 
 
 class _FrameMemory:
     '''
     Small amount of state carried between frames (frames are processed in
-    order): the last good result, how long it has been reused, and the lane
-    width measured so far.
+    order): the last confident result, how long it has been reused, the lane
+    width measured so far, and a thumbnail used to notice a change of scene.
     '''
 
     def __init__(self):
+        self.lane_width = float(_INITIAL_LANE_WIDTH_PX)
+        self.reset_tracking()
+        self._thumbnail = None
+
+    def reset_tracking(self):
         self.last_good = None
         self.hold_count = 0
-        self.lane_width = float(_INITIAL_LANE_WIDTH_PX)
+
+    def start_frame(self, frame):
+        '''Forget the last result if this frame is a different scene (e.g. a new clip).'''
+        thumbnail = cv2.resize(frame, (16, 12), interpolation=cv2.INTER_AREA).astype(np.int16)
+        if (self._thumbnail is not None
+                and np.abs(thumbnail - self._thumbnail).mean() > _SCENE_CUT_THRESHOLD):
+            self.reset_tracking()
+        self._thumbnail = thumbnail
 
     def remember(self, result):
         self.last_good = dict(result)
@@ -227,68 +275,170 @@ class _FrameMemory:
 _memory = _FrameMemory()
 
 
-def _collect_marking_samples(white_mask, yellow_mask, vehicle_x):
+def _lane_colour_masks(frame):
     '''
     Purpose:
     ---
-    Scan several horizontal bands and collect (row, x) samples of the
-    divider and of the nearest yellow edge on each side of it. Using many
-    bands means dash gaps in the divider do not break detection.
-
-    Input Arguments:
-    ---
-    `white_mask`, `yellow_mask` :  [ numpy.ndarray ]  binary masks
-    `vehicle_x` :  [ float ]  x-pixel of the vehicle (frame centre)
+    Threshold `frame` for the three things the pipeline needs: the white
+    divider, the yellow road edges and the dark asphalt. The vehicle's own
+    white chassis is blanked out of the white mask.
 
     Returns:
     ---
-    `divider_pts`, `left_pts`, `right_pts` :  [ list of (row, x) ]
+    `white_mask`, `yellow_mask`, `dark_mask` :  [ numpy.ndarray ]
     '''
-    divider_pts, left_pts, right_pts = [], [], []
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    white_mask = cv2.inRange(hsv, _WHITE_HSV_LOW, _WHITE_HSV_HIGH)
+    yellow_mask = cv2.inRange(hsv, _YELLOW_HSV_LOW, _YELLOW_HSV_HIGH)
+    dark_mask = hsv[:, :, 2] < _DARK_V_MAX
+
+    x0, y0, x1, y1 = _CAR_BOX
+    white_mask[y0:y1, x0:x1] = 0
+    return white_mask, yellow_mask, dark_mask
+
+
+def _find_dashes(white_mask, dark_mask):
+    '''
+    Purpose:
+    ---
+    Find white blobs that really are divider dashes. A dash has a sensible
+    size and lies ON the road, so the pixels around it are dark asphalt;
+    building walls, sky and kerbs fail that test.
+
+    Returns:
+    ---
+    `dashes` :  [ list of (centre_row, centre_col, area, rows, cols) ]
+    '''
+    height, width = white_mask.shape
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        (white_mask > 0).astype(np.uint8), connectivity=8)
+
+    dashes = []
+    for label in range(1, count):
+        x, y, w, h, area = stats[label]
+        if area < _DASH_MIN_AREA or area > _DASH_MAX_AREA or w > _DASH_MAX_WIDTH:
+            continue
+
+        x0, x1 = max(0, x - _RING_PX), min(width, x + w + _RING_PX)
+        y0, y1 = max(0, y - _RING_PX), min(height, y + h + _RING_PX)
+        window = labels[y0:y1, x0:x1]
+        surroundings = window == 0
+        n_surroundings = np.count_nonzero(surroundings)
+        if n_surroundings == 0:
+            continue
+        dark_share = np.count_nonzero(dark_mask[y0:y1, x0:x1] & surroundings) / n_surroundings
+        if dark_share < _MIN_ASPHALT_FRACTION:
+            continue
+
+        rows, cols = np.nonzero(window == label)
+        dashes.append((centroids[label][1], centroids[label][0], area, rows + y0, cols + x0))
+    return dashes
+
+
+def _fit_divider(dashes):
+    '''
+    Purpose:
+    ---
+    Fit x = f(y) through the pixels of the dashes: a straight line normally,
+    a second-order curve when the dashes span enough of the road to show a
+    bend. Dashes far from the line are dropped first. One tiny far-away
+    dash is not trusted.
+
+    Returns:
+    ---
+    `divider` :  [ _DividerFit or None ]
+    '''
+    kept = list(dashes)
+    if not kept:
+        return None
+
+    for _ in range(_FIT_MAX_REJECTIONS):
+        if len(kept) < 3:
+            break
+        rows = np.array([d[0] for d in kept])
+        cols = np.array([d[1] for d in kept])
+        weights = np.sqrt([d[2] for d in kept])
+        slope, intercept = np.polyfit(rows, cols, 1, w=weights)
+        residuals = np.abs(cols - (slope * rows + intercept))
+        worst = int(np.argmax(residuals))
+        if residuals[worst] <= _FIT_OUTLIER_PX:
+            break
+        del kept[worst]
+
+    if len(kept) == 1 and abs(kept[0][0] - _REF_ROW) > _LONE_DASH_MAX_ROW_GAP:
+        return None
+
+    ys = np.concatenate([d[3] for d in kept]).astype(np.float64)
+    xs = np.concatenate([d[4] for d in kept]).astype(np.float64)
+    if len(ys) > _FIT_MAX_PIXELS:
+        step = len(ys) // _FIT_MAX_PIXELS + 1
+        ys, xs = ys[::step], xs[::step]
+
+    span = ys.max() - ys.min()
+    outside = max(ys.min() - _REF_ROW, _REF_ROW - ys.max(), 0.0)
+    degree = 2 if (len(kept) >= 3 and span >= _QUAD_MIN_SPAN
+                   and outside <= _MAX_EXTRAPOLATION) else 1
+    if span < 3:
+        coeffs = np.array([0.0, float(xs.mean())])   # a vertical sliver: no slope to fit
+    else:
+        try:
+            coeffs = np.polyfit(ys, xs, degree)
+        except (np.linalg.LinAlgError, ValueError):
+            return None
+    return _DividerFit(coeffs, len(kept), int(len(ys)))
+
+
+def _collect_edge_samples(yellow_mask, divider):
+    '''
+    Purpose:
+    ---
+    Scan several horizontal bands and collect (row, x) samples of the yellow
+    road edge on each side of the divider. With no divider, the outermost
+    two yellow marks in a band are taken as the two road edges.
+
+    Returns:
+    ---
+    `left_pts`, `right_pts` :  [ list of (row, x) ]
+    '''
+    left_pts, right_pts = [], []
 
     for y_center in _SCAN_ROW_CENTRES:
         if y_center - _ROW_BAND_HALF_HEIGHT < 0:
             break
+        clusters = _row_band_clusters(yellow_mask, y_center, _ROW_BAND_HALF_HEIGHT)
 
-        white_clusters = _row_band_clusters(white_mask, y_center, _ROW_BAND_HALF_HEIGHT)
-        if not white_clusters:
-            continue
-        yellow_clusters = _row_band_clusters(yellow_mask, y_center, _ROW_BAND_HALF_HEIGHT)
+        if divider is not None:
+            divider_x = divider.x_at(y_center)
+            lefts = [x for x in clusters if x < divider_x]
+            rights = [x for x in clusters if x > divider_x]
+            if lefts:
+                left_pts.append((y_center, max(lefts)))
+            if rights:
+                right_pts.append((y_center, min(rights)))
+        elif len(clusters) >= 2:
+            left_pts.append((y_center, min(clusters)))
+            right_pts.append((y_center, max(clusters)))
 
-        # If both yellow road edges are visible, the divider must sit about
-        # halfway between them - use that to reject false white blobs.
-        target_x = vehicle_x
-        if len(yellow_clusters) >= 2:
-            span = max(yellow_clusters) - min(yellow_clusters)
-            if _ROAD_SPAN_MIN <= span <= _ROAD_SPAN_MAX:
-                target_x = (max(yellow_clusters) + min(yellow_clusters)) / 2.0
-
-        divider = min(white_clusters, key=lambda x: abs(x - target_x))
-        divider_pts.append((y_center, divider))
-
-        lefts = [x for x in yellow_clusters if x < divider]
-        rights = [x for x in yellow_clusters if x > divider]
-        if lefts:
-            left_pts.append((y_center, max(lefts)))
-        if rights:
-            right_pts.append((y_center, min(rights)))
-
-    return divider_pts, left_pts, right_pts
+    return left_pts, right_pts
 
 
-def _pick_lane_and_outer_edge(divider_x, vehicle_x, left_edge_x, right_edge_x):
+def _lane_result(divider_x, left_edge_x, right_edge_x, frame_width):
     '''
     Purpose:
     ---
     The vehicle is in the left lane when the divider is to its right, and in
-    the right lane otherwise. The outer edge of that lane is the matching
-    yellow line, or - if it is not visible - the divider shifted by the
-    learned lane width.
+    the right lane otherwise. The lane centre is halfway between the divider
+    and that lane's outer edge - the matching yellow line, or, if it is not
+    visible, the divider shifted by the learned lane width.
 
     Returns:
     ---
-    `lane`, `outer_x` :  [ str, float ]
+    `result` :  [ dict ]  {"center_x": int, "lane": str}
     '''
+    vehicle_x = frame_width / 2.0
+    _memory.update_lane_width(left_edge_x, right_edge_x)
+
     if divider_x > vehicle_x:
         lane, outer_x = LANE_LEFT, left_edge_x
     else:
@@ -297,27 +447,37 @@ def _pick_lane_and_outer_edge(divider_x, vehicle_x, left_edge_x, right_edge_x):
     if outer_x is None:
         sign = -1.0 if lane == LANE_LEFT else 1.0
         outer_x = divider_x + sign * _memory.lane_width
-    return lane, outer_x
+
+    center_x = int(round((divider_x + outer_x) / 2.0))
+    return {"center_x": max(0, min(frame_width - 1, center_x)), "lane": lane}
 
 
-def _lane_centre(divider_x, outer_x, lane, frame_width):
-    '''Midpoint of the lane, plus the per-lane bias correction, clamped to the frame.'''
-    offset = _OFFSET_LEFT_LANE_PX if lane == LANE_LEFT else _OFFSET_RIGHT_LANE_PX
-    center_x = int(round((divider_x + outer_x) / 2.0)) + offset
-    return max(0, min(frame_width - 1, center_x))
+def _lane_from_road_edges(left_edge_x, right_edge_x, frame_width):
+    '''
+    Purpose:
+    ---
+    With no divider visible, the divider sits halfway between the two road
+    edges. Use that - but only if both edges are seen and are a plausible
+    distance apart.
+
+    Returns:
+    ---
+    `result` :  [ dict or None ]
+    '''
+    if left_edge_x is None or right_edge_x is None:
+        return None
+    if not _ROAD_SPAN_MIN <= right_edge_x - left_edge_x <= _ROAD_SPAN_MAX:
+        return None
+    return _lane_result((left_edge_x + right_edge_x) / 2.0, left_edge_x, right_edge_x, frame_width)
 
 
 def _x_at_reference_row(points):
     '''
     Purpose:
     ---
-    Given (row, x) samples of one marking, return its x at _REF_ROW. One
+    Given (row, x) samples of one road edge, return its x at _REF_ROW. One
     sample is used as is; several are fitted with a line (one outlier
-    dropped) so dash gaps and perspective drift do not move the answer.
-
-    Input Arguments:
-    ---
-    `points` :  [ list of (row, x) ]
+    dropped).
 
     Returns:
     ---
@@ -337,106 +497,14 @@ def _x_at_reference_row(points):
         if len(points) >= 3:
             residuals = np.abs(xs - (slope * ys + intercept))
             worst = int(np.argmax(residuals))
-            if residuals[worst] > _FIT_OUTLIER_PX:
+            if residuals[worst] > _EDGE_FIT_OUTLIER_PX:
                 keep = np.arange(len(xs)) != worst
                 slope, intercept = np.polyfit(ys[keep], xs[keep], 1)
-        if abs(slope) > _FIT_MAX_SLOPE:
+        if abs(slope) > _EDGE_FIT_MAX_SLOPE:
             return nearest
         return float(slope * _REF_ROW + intercept)
-    except Exception:
+    except (np.linalg.LinAlgError, ValueError):
         return nearest
-
-
-def _lane_colour_masks(frame):
-    '''
-    Purpose:
-    ---
-    Threshold `frame` for the track's two marking colours - solid yellow
-    edges and dashed white centre divider - and remove render artefacts
-    that would otherwise be mistaken for the divider.
-
-    Returns:
-    ---
-    `white_mask`, `yellow_mask` :  [ numpy.ndarray ]  binary masks
-    '''
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-    white_mask = cv2.inRange(hsv, _WHITE_HSV_LOW, _WHITE_HSV_HIGH)
-    yellow_mask = cv2.inRange(hsv, _YELLOW_HSV_LOW, _YELLOW_HSV_HIGH)
-
-    white_mask = _remove_border_touching(white_mask)
-    if _USE_ROI_MASK:
-        white_mask = cv2.bitwise_and(white_mask, _roi_mask(white_mask.shape))
-    return white_mask, yellow_mask
-
-
-_roi_cache = {}
-
-
-def _roi_mask(shape):
-    '''
-    Purpose:
-    ---
-    Trapezoid region of interest: wide at the bottom of the frame, narrower
-    at _ROI_TOP_ROW, because lane markings converge with distance. White
-    blobs outside it (sky, side clutter) are ignored. The mask is built once
-    per frame size and cached.
-
-    Input Arguments:
-    ---
-    `shape` :  [ tuple ]  (height, width) of the mask
-
-    Returns:
-    ---
-    `mask` :  [ numpy.ndarray ]  uint8, 255 inside the trapezoid
-    '''
-    if shape not in _roi_cache:
-        height, width = shape[:2]
-        bottom_half = _ROI_BOTTOM_WIDTH * width / 2.0
-        top_half = _ROI_TOP_WIDTH * width / 2.0
-        mid = width / 2.0
-        polygon = np.array([[
-            (mid - bottom_half, height - 1),
-            (mid - top_half, _ROI_TOP_ROW),
-            (mid + top_half, _ROI_TOP_ROW),
-            (mid + bottom_half, height - 1),
-        ]], dtype=np.int32)
-        mask = np.zeros((height, width), dtype=np.uint8)
-        cv2.fillPoly(mask, polygon, 255)
-        _roi_cache[shape] = mask
-    return _roi_cache[shape]
-
-
-def _remove_border_touching(mask):
-    '''
-    Purpose:
-    ---
-    Remove white blobs that touch the frame edge (vehicle chassis/HUD, curb
-    artefacts) - EXCEPT narrow blobs touching only the top or bottom edge,
-    which are divider dashes running off the frame and must be kept.
-    '''
-    height, width = mask.shape
-    n, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8))
-    if n <= 1:
-        return mask
-
-    # Vectorised: decide per label, then clear every removed label in one
-    # pass (a per-blob full-frame comparison is too slow over thousands of frames).
-    x = stats[:, cv2.CC_STAT_LEFT]
-    y = stats[:, cv2.CC_STAT_TOP]
-    w = stats[:, cv2.CC_STAT_WIDTH]
-    h = stats[:, cv2.CC_STAT_HEIGHT]
-    touches_side = (x <= 0) | (x + w >= width)
-    touches_top_or_bottom = (y <= 0) | (y + h >= height)
-    is_divider_dash = touches_top_or_bottom & ~touches_side & (w <= _BORDER_KEEP_MAX_WIDTH)
-    remove = (touches_side | touches_top_or_bottom) & ~is_divider_dash
-    remove[0] = False  # label 0 is the background
-    if not remove.any():
-        return mask
-
-    cleaned = mask.copy()
-    cleaned[remove[labels]] = 0
-    return cleaned
 
 
 def _row_band_clusters(mask, y_center, half_height):
