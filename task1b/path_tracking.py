@@ -366,7 +366,7 @@ def main():
     args = parser.parse_args()
     schedule = parse_schedule(args.schedule) if args.schedule else None
 
-    from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+    from coppeliasim_zmqremoteapi_client import RemoteAPIClient # type: ignore
 
     sim = RemoteAPIClient().require("sim")
     sim.setStepping(True)
