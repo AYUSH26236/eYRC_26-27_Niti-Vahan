@@ -20,7 +20,7 @@
 '''
 
 # Team ID:          < NV_6236 >
-# Author List:      < Ayush Tiwari , Anushka Telore , Atharva Jadhav , utkarssh singh >
+# Author List:      < Ayush Tiwari, Anushka Telore, Atharva Jadhav, Utkarsh Singh >
 # Filename:         path_tracking.py
 # Functions:        ackermann_wheel_angles, compute_steering
 
