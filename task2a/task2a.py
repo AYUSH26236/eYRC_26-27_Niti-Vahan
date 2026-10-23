@@ -19,11 +19,13 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          NV_6236
+# Author List:      Utkarsh Singh, Ayush Tiwari, Anushka Telore, Atharva Jadhav
 # Filename:         task2a.py
 # Functions:        detect_lane, compute_control
-# Global variables: < List any global variables you add, "None" if you add none >
+# Global variables: WHEELBASE, TRACK, MAX_STEER, WHEEL_RADIUS, CRUISE, LANE_WIDTH_M, ROI_TOP,
+#                   SCAN_STEP, NEAR_ROW, AXIS_X, YELLOW_LO, YELLOW_HI, WHITE_LO, WHITE_HI,
+#                   K_STANLEY, K_SOFT, PSI_GAIN, SMOOTH, MAX_MISS, _S
 
 
 ####################### IMPORT MODULES #######################
@@ -53,6 +55,49 @@ STOP_SIGNAL = 'NV_stop'
 ##############################################################
 ############### ADD YOUR IMPLEMENTATION HERE #################
 ##############################################################
+
+import math
+
+# ---------------- TUNE: vehicle (run probe_scene.py to read these) ----------------
+WHEELBASE = 0.30                 # m, rear axle to front steering axis
+TRACK = 0.20                     # m, distance between the two steering joints
+MAX_STEER = math.radians(40.0)   # stay inside the 45 deg limit
+WHEEL_RADIUS = 0.05              # m
+CRUISE = 4.0                     # rad/s on both drive motors
+
+# ---------------- TUNE: lane / camera ----------------
+LANE_WIDTH_M = 0.40              # real width of one lane in metres (sets the e scale)
+ROI_TOP = 0.45                   # ignore the top part of the frame (fraction of height)
+SCAN_STEP = 4                    # px between scanned rows
+NEAR_ROW = 0.90                  # row (fraction of height) where e and psi are read
+AXIS_X = None                    # vehicle axis column in px; None = image centre
+YELLOW_LO, YELLOW_HI = (15, 80, 80), (40, 255, 255)
+WHITE_LO, WHITE_HI = (0, 0, 170), (180, 60, 255)
+
+# ---------------- TUNE: controller ----------------
+K_STANLEY = 1.5                  # cross-track gain
+K_SOFT = 0.05                    # keeps atan() sane at very low speed
+PSI_GAIN = 0.5                   # perspective view exaggerates slope; scale it down
+SMOOTH = 0.5                     # 0..1, higher = smoother but slower to react
+MAX_MISS = 8                     # frames to hold the last estimate when detection fails
+
+# state kept between frames
+_S = {'rw': {}, 'rc': {}, 'last': None, 'miss': 0, 'delta': 0.0}
+
+
+def _marking_mask(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    m = cv2.bitwise_or(cv2.inRange(hsv, YELLOW_LO, YELLOW_HI),
+                       cv2.inRange(hsv, WHITE_LO, WHITE_HI))
+    return cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+
+def _ackermann(delta):
+    t = math.tan(delta)
+    left = math.atan2(WHEELBASE * t, WHEELBASE - 0.5 * TRACK * t)
+    right = math.atan2(WHEELBASE * t, WHEELBASE + 0.5 * TRACK * t)
+    return left, right
+
 
 def detect_lane(frame):
     '''
@@ -93,9 +138,78 @@ def detect_lane(frame):
     on staying the correct side of the dashed line.
     '''
 
-    # ADD YOUR CODE HERE
+    # Returns (e, psi) with e in metres and psi in radians, both positive to the
+    # LEFT of the vehicle, or None when no usable lane was found.
+    h, w = frame.shape[:2]
+    cx = AXIS_X if AXIS_X is not None else (w - 1) / 2.0
+    mask = _marking_mask(frame)
+    y0 = int(h * ROI_TOP)
 
-    return None
+    rows, cents = [], []
+    for y in range(h - 1, y0, -SCAN_STEP):
+        cols = np.flatnonzero(mask[y])
+        if cols.size == 0:
+            continue
+        left = cols[cols < cx - 3]
+        right = cols[cols > cx + 3]
+        l = int(left[-1]) if left.size else None     # nearest marking on the left
+        r = int(right[0]) if right.size else None    # nearest marking on the right
+        wk = _S['rw'].get(y)
+        prev = _S['rc'].get(y, cx)
+        c = None
+        if l is not None and r is not None:
+            g = r - l
+            if wk is None:
+                c = 0.5 * (l + r)
+                _S['rw'][y] = float(g)
+            elif g < 0.6 * wk:
+                continue                              # stray blob, skip this row
+            elif g <= 1.35 * wk:
+                c = 0.5 * (l + r)
+                _S['rw'][y] = 0.9 * wk + 0.1 * g
+            else:
+                # gap too wide: a dash of the divider is missing, so trust the
+                # marking that keeps the centre closest to where it was
+                c1, c2 = l + 0.5 * wk, r - 0.5 * wk
+                c = c1 if abs(c1 - prev) <= abs(c2 - prev) else c2
+        elif wk is not None and l is not None:
+            c = l + 0.5 * wk
+        elif wk is not None and r is not None:
+            c = r - 0.5 * wk
+        if c is None:
+            continue
+        _S['rc'][y] = c
+        rows.append(y)
+        cents.append(c)
+
+    if len(rows) < 5:
+        _S['miss'] += 1
+        return None
+
+    ys = np.array(rows, dtype=float)
+    xs = np.array(cents, dtype=float)
+    deg = 2 if len(ys) >= 8 else 1
+    co = np.polyfit(ys, xs, deg)
+    res = np.abs(np.polyval(co, ys) - xs)
+    keep = res <= max(3.0, 2.5 * float(np.median(res)))
+    if 5 <= keep.sum() < len(ys):
+        co = np.polyfit(ys[keep], xs[keep], deg)
+
+    yn = min(h * NEAR_ROW, float(ys.max()))
+    xn = float(np.polyval(co, yn))
+    dxdy = float(np.polyval(np.polyder(co), yn))
+
+    near = [v for k, v in _S['rw'].items() if abs(k - yn) <= 16]
+    if not near:
+        _S['miss'] += 1
+        return None
+    m_per_px = LANE_WIDTH_M / float(np.median(near))
+
+    e = (cx - xn) * m_per_px          # + when the lane centre is to the left
+    psi = PSI_GAIN * math.atan(dxdy)  # + when the lane runs off to the left
+    _S['miss'] = 0
+    _S['last'] = (e, psi)
+    return (e, psi)
 
 
 def compute_control(detection, stop_requested):
@@ -147,9 +261,27 @@ def compute_control(detection, stop_requested):
     defensible - doing nothing is not.
     '''
 
-    # ADD YOUR CODE HERE
+    speed = CRUISE
+    if detection is None:
+        # hold the last good estimate briefly, then straighten up and creep
+        if _S['last'] is not None and _S['miss'] <= MAX_MISS:
+            e, psi = _S['last']
+        else:
+            e, psi = 0.0, 0.0
+            speed = 0.3 * CRUISE
+    else:
+        e, psi = detection
 
-    return 0.0, 0.0, 0.0
+    v = max(CRUISE * WHEEL_RADIUS, 0.05)
+    delta = psi + math.atan2(K_STANLEY * e, v + K_SOFT)       # Stanley
+    delta = max(-MAX_STEER, min(MAX_STEER, delta))
+    delta = SMOOTH * _S['delta'] + (1.0 - SMOOTH) * delta
+    _S['delta'] = delta
+
+    left_angle, right_angle = _ackermann(delta)               # Task 1A split
+    if stop_requested:
+        return left_angle, right_angle, 0.0
+    return left_angle, right_angle, speed
 
 
 ##############################################################

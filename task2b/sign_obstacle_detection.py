@@ -22,7 +22,7 @@
 # Team ID:          < NV_6236 >
 # Author List:      < Ayush Tiwari, Anushka Telore, Atharva Jadhav, Utkarsh Singh >
 # Filename:         sign_obstacle_detection.py
-# Functions:        detect_signs, detect_obstacle, _red_mask
+# Functions:        detect_signs, detect_obstacle, _red_mask, _red_fill, _rectify
 # Global variables: None
 
 
@@ -85,13 +85,12 @@ def detect_signs(image):
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     height, width = image.shape[:2]
     frame_area = height * width
-    red = _red_mask(hsv)
+    shapes = []   # (x, y, w, h, label, area)
 
-    # Red-bordered signs: the circular sign is Speed40 and the triangular
-    # sign is School. Tiny red lane-corner markers are rejected by size.
+    # ---- Red-ring signs: circle = Speed40, triangle = School ----------------
+    red = _red_mask(hsv)
     red_contours, _ = cv2.findContours(red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     red_floor = max(220.0, frame_area * 0.00030)
-    shapes = []
     for contour in red_contours:
         contour_area = cv2.contourArea(contour)
         if contour_area < red_floor:
@@ -102,16 +101,19 @@ def detect_signs(image):
         perimeter = cv2.arcLength(contour, True)
         if perimeter <= 0:
             continue
+        # A sign is a red RING (white inside); a solid red blob is the obstacle.
+        if _red_fill(red, contour) > 0.70:
+            continue
         polygon = cv2.approxPolyDP(contour, 0.035 * perimeter, True)
         circularity = 4.0 * np.pi * contour_area / (perimeter * perimeter)
         aspect = w / float(h)
         if 0.60 <= aspect <= 1.40 and circularity >= 0.66 and len(polygon) >= 5:
-            shapes.append((x, y, w, h, "Speed40", contour_area))
+            # circle: mean of bounding-box and filled-contour area
+            shapes.append((x, y, w, h, "Speed40", 0.5 * (w * h + contour_area)))
         elif len(polygon) == 3 and 0.48 <= aspect <= 1.35:
             shapes.append((x, y, w, h, "School", contour_area))
 
-    # Compact, nearly square blue faces are candidate Parking/Hospital signs.
-    # Building windows are rejected by requiring a bright sign glyph.
+    # ---- Blue square signs: Parking / Hospital -----------------------------
     blue = cv2.inRange(hsv, np.array([88, 75, 45], dtype=np.uint8),
                        np.array([140, 255, 255], dtype=np.uint8))
     blue_contours, hierarchy = cv2.findContours(blue, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -125,10 +127,13 @@ def detect_signs(image):
             if contour_area < blue_floor:
                 continue
             x, y, w, h = cv2.boundingRect(contour)
-            aspect = w / float(h)
-            if min(w, h) < max(24, int(min(height, width) * 0.035)):
+            if min(w, h) < max(20, int(min(height, width) * 0.030)):
                 continue
-            if not (0.78 <= aspect <= 1.28):
+            # tilted signs have a taller/wider bounding box, so be tolerant
+            if not (0.60 <= w / float(h) <= 1.60):
+                continue
+            hull_area = cv2.contourArea(cv2.convexHull(contour))
+            if hull_area <= 0 or contour_area / hull_area < 0.80:
                 continue
             perimeter = cv2.arcLength(contour, True)
             if perimeter <= 0:
@@ -136,38 +141,42 @@ def detect_signs(image):
             polygon = cv2.approxPolyDP(contour, 0.055 * perimeter, True)
             if len(polygon) < 4 or len(polygon) > 8:
                 continue
+            clipped = x <= 1 or y <= 1 or x + w >= width - 1 or y + h >= height - 1
 
-            # A blue counter inside the white P creates a deeper contour
-            # hierarchy. At smaller sizes, the lower-right glyph stroke is
-            # a useful second cue: H reaches that corner and P does not.
-            max_depth = 0
+            # Straighten the sign face into 64x64 so tilt/perspective do not matter.
+            if clipped:
+                face = cv2.resize(image[y:y + h, x:x + w], (64, 64))
+            else:
+                face = _rectify(image, contour)
+            face_hsv = cv2.cvtColor(face, cv2.COLOR_BGR2HSV)
+            # Letter = bright, unsaturated pixels. Building windows have none.
+            glyph = (face_hsv[:, :, 2] >= 115) & (face_hsv[:, :, 1] <= 105)
+            inner_fraction = float(glyph[12:52, 12:52].mean())
+            if not (0.15 <= inner_fraction <= 0.70):
+                continue
+
+            # H has a leg in the lower-right, P has none. Compare the two lower halves.
+            lower_left = float(glyph[36:56, 14:30].mean())
+            lower_right = float(glyph[36:56, 34:50].mean())
+            p_like = lower_right < 0.40 * max(lower_left, 0.05)
+
+            # Second cue: the closed counter of the P is a blue island inside the white letter.
+            depth = 0
             child = hierarchy[index][2]
             while child != -1:
-                max_depth = max(max_depth, 1)
-                grandchild = hierarchy[child][2]
-                while grandchild != -1:
-                    max_depth = max(max_depth, 2)
-                    grandchild = hierarchy[grandchild][0]
+                depth = max(depth, 1)
+                grand = hierarchy[child][2]
+                while grand != -1:
+                    depth = 2
+                    grand = hierarchy[grand][0]
                 child = hierarchy[child][0]
+            # A sign cut off by the frame hides its lower-right corner, which
+            # looks like a P, so a clipped sign is only called Hospital when
+            # its H crossbar/legs are clearly visible.
+            label = "Parking" if (p_like or depth >= 2 or clipped) else "Hospital"
+            shapes.append((x, y, w, h, label, 0.5 * (w * h + contour_area)))
 
-            pad_x = max(1, int(w * 0.12))
-            pad_y = max(1, int(h * 0.12))
-            x0, x1 = x + pad_x, x + w - pad_x
-            y0, y1 = y + pad_y, y + h - pad_y
-            if x1 <= x0 or y1 <= y0:
-                continue
-            patch = cv2.resize(image[y0:y1, x0:x1], (64, 64), interpolation=cv2.INTER_LINEAR)
-            patch_hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-            white = ((patch_hsv[:, :, 2] >= 150) & (patch_hsv[:, :, 1] <= 105)).astype(np.uint8)
-            total_white = int(white[8:58, 8:58].sum())
-            if total_white < 35:
-                continue
-            lower_right = int(white[36:58, 34:58].sum())
-            clipped_at_frame = x <= 1 or y <= 1 or x + w >= width - 1 or y + h >= height - 1
-            label = "Parking" if max_depth >= 2 or lower_right < 0.095 * total_white or clipped_at_frame else "Hospital"
-            shapes.append((x, y, w, h, label, contour_area))
-
-    # Collapse nearby fragments of the same sign, retaining the largest.
+    # ---- Merge fragments of the same sign, keeping the largest -------------
     accepted = []
     for candidate in sorted(shapes, key=lambda item: item[5], reverse=True):
         x, y, w, h, label, _ = candidate
@@ -175,16 +184,17 @@ def detect_signs(image):
         duplicate = False
         for old in accepted:
             ox, oy, ow, oh, old_label, _ = old
-            if (label == old_label and abs(cx - (ox + ow / 2.0)) < 0.45 * max(w, ow)
-                    and abs(cy - (oy + oh / 2.0)) < 0.45 * max(h, oh)):
+            if (abs(cx - (ox + ow / 2.0)) < 0.45 * max(w, ow)
+                    and abs(cy - (oy + oh / 2.0)) < 0.45 * max(h, oh)
+                    and (label == old_label or label in ("Parking", "Hospital")
+                         and old_label in ("Parking", "Hospital"))):
                 duplicate = True
                 break
         if not duplicate:
             accepted.append(candidate)
 
-    for x, y, w, h, label, _ in accepted:
-        # Bounding footprint of the sign face, excluding its support pole.
-        detections.append({"label": label, "area": int(w * h)})
+    for x, y, w, h, label, area in accepted:
+        detections.append({"label": label, "area": int(round(area))})
     detections.sort(key=lambda entry: (SIGN_LABELS.index(entry["label"]), entry["area"]))
     ############################################################
 
@@ -234,26 +244,30 @@ def detect_obstacle(image):
     height, width = image.shape[:2]
     red = _red_mask(hsv)
     contours, _ = cv2.findContours(red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    minimum_area = max(650.0, height * width * 0.0010)
+    minimum_area = max(300.0, height * width * 0.0004)
     candidates = []
     for contour in contours:
         contour_area = cv2.contourArea(contour)
         if contour_area < minimum_area:
             continue
         x, y, w, h = cv2.boundingRect(contour)
-        if min(w, h) < 24:
+        if min(w, h) < 14:
             continue
-        perimeter = cv2.arcLength(contour, True)
-        if perimeter <= 0:
+        hull_area = cv2.contourArea(cv2.convexHull(contour))
+        if hull_area <= 0:
             continue
-        polygon = cv2.approxPolyDP(contour, 0.035 * perimeter, True)
-        # Public obstacles have a four-corner cuboid silhouette; round and
-        # triangular red signs are excluded even when similarly sized.
-        if len(polygon) == 4:
-            candidates.append((contour_area, w * h))
+        # The obstacle is a SOLID, convex red block. Red-ring signs are hollow
+        # (white inside) and the hospital's red cross is not convex.
+        if contour_area / hull_area < 0.82:
+            continue
+        if _red_fill(red, contour) < 0.72:
+            continue
+        if not (0.35 <= w / float(h) <= 2.5):
+            continue
+        candidates.append((contour_area, 0.5 * (w * h + contour_area)))
     if candidates:
         present = True
-        area = int(max(candidates, key=lambda item: item[0])[1])
+        area = int(round(max(candidates, key=lambda item: item[0])[1]))
     ############################################################
 
     return {"present": present, "area": area}
@@ -266,6 +280,27 @@ def detect_obstacle(image):
 # evaluation script only ever calls those two functions. List them in
 # the file header too.
 # ------------------------------------------------------------------
+
+def _red_fill(mask, contour):
+    """Fraction of the area inside `contour` that is red in `mask` (ring ~0.35, solid ~0.95)."""
+    x, y, w, h = cv2.boundingRect(contour)
+    filled = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(filled, [contour - np.array([x, y])], -1, 255, thickness=-1)
+    inside = int(np.count_nonzero(filled))
+    if inside == 0:
+        return 0.0
+    return float(np.count_nonzero(cv2.bitwise_and(filled, mask[y:y + h, x:x + w]))) / inside
+
+
+def _rectify(image, contour):
+    """Warp the (possibly tilted) sign face to an upright 64x64 square."""
+    box = cv2.boxPoints(cv2.minAreaRect(contour))
+    s = box.sum(axis=1)
+    d = np.diff(box, axis=1).ravel()
+    src = np.float32([box[np.argmin(s)], box[np.argmin(d)], box[np.argmax(s)], box[np.argmax(d)]])
+    dst = np.float32([[0, 0], [63, 0], [63, 63], [0, 63]])
+    return cv2.warpPerspective(image, cv2.getPerspectiveTransform(src, dst), (64, 64))
+
 
 def _red_mask(hsv):
     """Return a cleaned mask covering both ends of OpenCV's red hue range."""
