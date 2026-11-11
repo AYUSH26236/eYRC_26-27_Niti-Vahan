@@ -19,11 +19,14 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          < NV_6236 >
+# Author List:      < Ayush Tiwari, Anushka Telore, Atharva Jadhav, Utkarsh Singh >
 # Filename:         task2c.py
-# Functions:        parking_manoeuvre
-# Global variables: < List any global variables you add, "None" if you add none >
+# Functions:        parking_manoeuvre, _path_steering, _speed_for, _marker_lost
+# Global variables: CRUISE_SPEED, CREEP_SPEED, CREEP_FROM, CRUISE_UNTIL, PLAN_END_FORWARD,
+#                   MIN_PLAN_RANGE, STOP_LEAD, MAX_STEERING, HEADING_CAP, BEARING_LIMIT,
+#                   PATH_GAIN, STEER_GAIN, HOLD_FRAMES, GIVE_UP_FRAMES, SEARCH_STEERING,
+#                   _last_steering, _lost_frames, _last_bearing
 
 
 ####################### IMPORT MODULES #######################
@@ -68,75 +71,115 @@ BAY_WIDTH          = 0.22    # m - the vehicle is 0.18 m across
 ############### ADD YOUR IMPLEMENTATION HERE #################
 ##############################################################
 
+# ---- tuning constants ---------------------------------------------------------
+CRUISE_SPEED     = 2.0                      # rad/s - kept low: the camera pose estimate drifts if the vehicle moves too far per frame
+CREEP_SPEED      = 1.5                      # rad/s - the last stretch into the bay
+CREEP_FROM       = 0.30                     # m - 'forward' at which we are fully down to creep speed
+CRUISE_UNTIL     = 0.70                     # m - 'forward' above which we drive at full speed
+
+PLAN_END_FORWARD = 0.55                     # m - 'forward' by which we want to be on the line and straight (mouth is 0.37)
+MIN_PLAN_RANGE   = 0.10                     # m - floor on the distance left to plan over (keeps late steering gentle)
+STOP_LEAD        = 0.004                    # m - stop this much early, so the roll-out ends on the mark
+
+MAX_STEERING     = np.deg2rad(45.0)         # vehicle limit
+HEADING_CAP      = np.deg2rad(42.0)         # steepest crossing: more and the marker leaves the camera view
+BEARING_LIMIT    = np.deg2rad(43.0)         # marker this far off-centre in the image: stop turning further
+PATH_GAIN        = 2.0                      # smooth crossing is about this much steeper than a straight line
+STEER_GAIN       = 0.8                      # steering (rad) per rad of heading error (low: the pose is noisy)
+HOLD_FRAMES      = 6                        # frames to keep steering blind after the marker is lost
+GIVE_UP_FRAMES   = 80                       # frames without the marker before the vehicle stops
+SEARCH_STEERING  = np.deg2rad(20.0)         # how hard to turn towards the marker's last side while it is lost
+
+_last_steering = 0.0                        # steering sent on the previous frame
+_lost_frames   = 0                          # consecutive frames without the marker
+_last_bearing  = 0.0                        # where the marker was last seen in the camera view
+
+
 def parking_manoeuvre(pose):
     '''
     Purpose:
     ---
-    Decide, every frame, how to steer and how fast to drive so that the
-    vehicle ends up inside the target bay - on its centre line, parallel to
-    it, stopped in the middle.
+    Park in the target bay by following a smooth path onto the bay's centre line.
 
-    This is the whole of Task 2C. Finding the marker in the camera image and
-    working out where the vehicle is relative to the bay is done for you
-    below; you are handed the answer as `pose` and decide what to do with it.
+    Idea:
+    ---
+    Do not steer at the marker. Instead, every frame, work out which HEADING
+    would bring the vehicle onto the centre line in the distance that is left,
+    and steer to hold that heading:
+
+        wanted heading = -atan( PATH_GAIN * lateral / distance_left )
+
+      * far from the line it asks for a steep crossing (capped, so the marker
+        stays in the camera view) - this is the early, hard turn;
+      * as lateral shrinks the wanted heading shrinks with it, so the vehicle
+        straightens out by itself, before the bay mouth;
+      * bay 1 (twice the offset) simply gets a steeper, longer turn than bay 0.
+
+    Then it slows to a creep and stops in the middle of the bay.
 
     Input Arguments:
     ---
-    `pose` :    [ dict or None ]
-        None on a frame where the target bay's marker was not seen.
-        Otherwise where the vehicle is, relative to the target bay:
-
-          'lateral'  [float] metres. Sideways offset of the front axle from
-                             the bay's centre line. POSITIVE = the vehicle
-                             is to the LEFT of the line. 0 = on it.
-          'heading'  [float] radians. Direction the vehicle points, relative
-                             to the bay's long axis. 0 = parallel to the bay.
-                             POSITIVE = turned to the LEFT.
-          'forward'  [float] metres. Distance along the road from the
-                             vehicle's centre to the marker line. It shrinks
-                             as you approach: BAY_MOUTH_FORWARD at the mouth,
-                             BAY_MIDDLE_FORWARD in the middle of the bay.
-          'bearing'  [float] radians. Where the marker appears in the camera
-                             view. 0 = straight ahead, POSITIVE = to the LEFT.
+    `pose` :    [ dict or None ]   see the task description
 
     Returns:
     ---
-    `steering` :    [ float ]
-        Steering angle in RADIANS, POSITIVE TO THE LEFT. It is split into
-        the two front-wheel angles and clamped to the vehicle's 45 degree
-        limit for you.
-
-    `speed` :       [ float ]
-        Target velocity for both drive motors, in rad/s. Positive drives
-        forwards. 0.0 holds the vehicle still.
-
-    `parked` :      [ bool ]
-        True once the vehicle is parked. Returning True stops the vehicle
-        and ends the run, so return it only when you are done.
-
-    Example call:
-    ---
-    steering, speed, parked = parking_manoeuvre(pose)
-
-    REMEMBER:
-    ---
-    Steering straight AT the marker is not parking. The bays are to the
-    right of the road, so pointing at the marker brings the vehicle in on a
-    diagonal, and a car that arrives crooked does not fit a bay with ~20 mm
-    to spare each side. Both 'lateral' and 'heading' have to reach zero.
-
-    The camera is 95 degrees wide. Turn much more than ~40 degrees across the
-    road and the marker slides out of view - `pose` becomes None, and there
-    is nothing left to steer by.
-
-    A single None frame is normal. Decide what to do on one; doing nothing
-    sensible is how a vehicle drives off.
+    `steering` :    [ float ]   radians, positive = left
+    `speed` :       [ float ]   rad/s
+    `parked` :      [ bool ]    True when stopped in the middle of the bay
     '''
+    global _last_steering, _lost_frames, _last_bearing
 
-    # ADD YOUR CODE HERE
+    if pose is None:
+        return _marker_lost()
+    _lost_frames = 0
+    _last_bearing = pose['bearing']
 
+    if pose['forward'] <= BAY_MIDDLE_FORWARD + STOP_LEAD:
+        return 0.0, 0.0, True
+
+    steering = _path_steering(pose)
+    _last_steering = steering
+    return steering, _speed_for(pose['forward']), False
+
+
+def _path_steering(pose):
+    '''Steer to hold the heading that brings the vehicle onto the centre line in time.'''
+    lateral = pose['lateral']       # m, + = left of the centre line (front axle)
+    heading = pose['heading']       # rad, + = turned left
+
+    # Distance left to run before the vehicle must be on the line and straight.
+    plan_range = max(pose['forward'] - PLAN_END_FORWARD, MIN_PLAN_RANGE)
+
+    # Heading wanted right now: a smooth crossing is about PATH_GAIN times steeper than the
+    # straight line from here to the line, so aim that steep - but never past the cap.
+    # It fades to zero as the offset does, which is what straightens the vehicle out.
+    wanted = -np.arctan(PATH_GAIN * lateral / plan_range)
+    wanted = float(np.clip(wanted, -HEADING_CAP, HEADING_CAP))
+
+    # The marker is about to leave the camera view: stop turning further that way.
+    if abs(pose['bearing']) > BEARING_LIMIT and wanted * pose['bearing'] < 0.0:
+        wanted = max(wanted, heading) if wanted < 0.0 else min(wanted, heading)
+
+    steering = STEER_GAIN * (wanted - heading)
+    return float(np.clip(steering, -MAX_STEERING, MAX_STEERING))
+
+
+def _speed_for(forward):
+    '''Full speed far out, easing down to a slow creep for the last stretch.'''
+    return float(np.interp(forward, [CREEP_FROM, CRUISE_UNTIL], [CREEP_SPEED, CRUISE_SPEED]))
+
+
+def _marker_lost():
+    '''A missed frame is normal: hold the last steering, creeping. If it persists, turn back
+    towards where the marker was last seen (it slides out of view when we are turned too
+    far), and if that fails, stop.'''
+    global _lost_frames
+    _lost_frames += 1
+    if _lost_frames <= HOLD_FRAMES:
+        return _last_steering, CREEP_SPEED, False
+    if _lost_frames <= GIVE_UP_FRAMES:
+        return float(np.sign(_last_bearing) * SEARCH_STEERING), CREEP_SPEED, False
     return 0.0, 0.0, False
-
 
 ##############################################################
 ############## END OF YOUR IMPLEMENTATION ####################

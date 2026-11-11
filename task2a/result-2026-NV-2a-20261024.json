@@ -17,20 +17,20 @@
         {
             "lane": "outer",
             "reason": "lap complete",
-            "samples": 1894,
+            "samples": 4556,
             "stops_raised": 2,
             "stops_total": 2,
-            "sim_seconds": 150.6,
-            "wall_seconds": 19.86
+            "sim_seconds": 248.85,
+            "wall_seconds": 44.56
         },
         {
             "lane": "inner",
             "reason": "lap complete",
-            "samples": 1587,
+            "samples": 3817,
             "stops_raised": 2,
             "stops_total": 2,
-            "sim_seconds": 127.4,
-            "wall_seconds": 17.15
+            "sim_seconds": 209.35,
+            "wall_seconds": 37.27
         }
     ],
     "manifest": {
@@ -39,20 +39,20 @@
             {
                 "lane": "outer",
                 "reason": "lap complete",
-                "samples": 1894,
+                "samples": 4556,
                 "stops_raised": 2,
                 "stops_total": 2,
-                "sim_seconds": 150.6,
-                "wall_seconds": 19.86
+                "sim_seconds": 248.85,
+                "wall_seconds": 44.56
             },
             {
                 "lane": "inner",
                 "reason": "lap complete",
-                "samples": 1587,
+                "samples": 3817,
                 "stops_raised": 2,
                 "stops_total": 2,
-                "sim_seconds": 127.4,
-                "wall_seconds": 17.15
+                "sim_seconds": 209.35,
+                "wall_seconds": 37.27
             }
         ],
         "integrity": {
@@ -62,7 +62,7 @@
             "forbidden_calls": []
         },
         "csv_name": "NV_Task2A_run.csv",
-        "csv_rows": 3481,
+        "csv_rows": 8373,
         "csv_columns": [
             "lane",
             "t_sim",
@@ -72,7 +72,7 @@
             "speed",
             "stop_flag"
         ],
-        "csv_sha256": "d4269cf8f42a5d8d3fb522d2ae635facc0d473d6220a52abd867824ef44876dd",
+        "csv_sha256": "5f9d2809b425e4a02163646e1818aefb4bf768384a7b8424d4765bccd870c124",
         "stop_at": [
             0.33,
             0.66
@@ -80,7 +80,7 @@
         "stop_hold_s": 5.0,
         "lap_close": 0.97,
         "script_name": "task2a.py",
-        "script_sha256": "4c48331fbb550aad24b6cc1bf67143ea34b438f2994c3becf08f74f436647b62",
+        "script_sha256": "b752b5811205971cd242f6398d1e3b2f34a56460f5c495769bcda3bfb00bf856",
         "team": "6236",
         "host": "Ayushs-MacBook-Air-2.local",
         "os_info": {
@@ -89,13 +89,13 @@
             "machine": "arm64"
         },
         "python": "3.10.21",
-        "started_at": "2026-10-22T16:51:20+00:00",
-        "finished_at": "2026-10-22T16:51:58+00:00",
-        "wall_seconds": 38.4,
-        "nonce": "6059c657b30b4facb6458b746d6b689b"
+        "started_at": "2026-10-24T07:13:22+00:00",
+        "finished_at": "2026-10-24T07:14:46+00:00",
+        "wall_seconds": 83.6,
+        "nonce": "32aff9b69bbf40f88885ec7ecc662c30"
     },
-    "hmac": "560d2c077e625b26ab1ff3d376e5a93a10051b9d1dd54db0bc1d6fe9592218cb",
+    "hmac": "53504cdbe843fe164ff4a0ed470ab44346d18fd066c8b2139d11546468c1376a",
     "meta": {
-        "evaluation_time": 38.598220109939575
+        "evaluation_time": 83.72224497795105
     }
 }

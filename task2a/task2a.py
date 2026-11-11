@@ -81,6 +81,11 @@ PSI_GAIN = 0.5                   # perspective view exaggerates slope; scale it 
 SMOOTH = 0.5                     # 0..1, higher = smoother but slower to react
 MAX_MISS = 8                     # frames to hold the last estimate when detection fails
 
+# ---------------- TUNE: speed easing ----------------
+EASE_E_GAIN = 4.0                # speed lost per metre of offset from the lane middle
+EASE_PSI_GAIN = 0.6              # speed lost per radian of heading error
+MIN_SPEED_FRAC = 0.6             # never slow below this fraction of CRUISE
+
 # state kept between frames
 _S = {'rw': {}, 'rc': {}, 'last': None, 'miss': 0, 'delta': 0.0}
 
@@ -271,6 +276,9 @@ def compute_control(detection, stop_requested):
             speed = 0.3 * CRUISE
     else:
         e, psi = detection
+        # ease off while off-centre or crooked, so corners are not overshot
+        slow = 1.0 - EASE_E_GAIN * abs(e) - EASE_PSI_GAIN * abs(psi)
+        speed = CRUISE * min(1.0, max(MIN_SPEED_FRAC, slow))
 
     v = max(CRUISE * WHEEL_RADIUS, 0.05)
     delta = psi + math.atan2(K_STANLEY * e, v + K_SOFT)       # Stanley

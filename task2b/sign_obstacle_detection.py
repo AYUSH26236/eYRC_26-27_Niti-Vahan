@@ -109,7 +109,7 @@ def detect_signs(image):
         aspect = w / float(h)
         if 0.60 <= aspect <= 1.40 and circularity >= 0.66 and len(polygon) >= 5:
             # circle: mean of bounding-box and filled-contour area
-            shapes.append((x, y, w, h, "Speed40", 0.5 * (w * h + contour_area)))
+            shapes.append((x, y, w, h, "Speed40", contour_area))
         elif len(polygon) == 3 and 0.48 <= aspect <= 1.35:
             shapes.append((x, y, w, h, "School", contour_area))
 
@@ -174,7 +174,7 @@ def detect_signs(image):
             # looks like a P, so a clipped sign is only called Hospital when
             # its H crossbar/legs are clearly visible.
             label = "Parking" if (p_like or depth >= 2 or clipped) else "Hospital"
-            shapes.append((x, y, w, h, label, 0.5 * (w * h + contour_area)))
+            shapes.append((x, y, w, h, label, contour_area))
 
     # ---- Merge fragments of the same sign, keeping the largest -------------
     accepted = []
@@ -264,7 +264,7 @@ def detect_obstacle(image):
             continue
         if not (0.35 <= w / float(h) <= 2.5):
             continue
-        candidates.append((contour_area, 0.5 * (w * h + contour_area)))
+        candidates.append((contour_area, contour_area))
     if candidates:
         present = True
         area = int(round(max(candidates, key=lambda item: item[0])[1]))
