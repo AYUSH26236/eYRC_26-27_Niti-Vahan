@@ -124,6 +124,8 @@ SIGN_DEBUG = (
 )
 
 DEBUG_LOG_PATH = os.environ.get("NV_DEBUG_LOG", "").strip()
+NO_LANE_CHANGE = os.environ.get("NV_NO_LANE_CHANGE", "1").strip() == "1"
+LANE_CHANGE_MAX_FRAMES = 120
 
 _SIM_NOW = [0.0]
 _raw_print = print
@@ -2026,6 +2028,7 @@ class Task3Controller:
         self.lane_change_progress = 0.0
         self.previous_lane_error = None
         self.last_lane_change_frame = -LANE_CHANGE_REARM_FRAMES
+        self.lane_change_frames = 0
         self.completed_obstacle_avoids = 0
         # True only while an obstacle blocks our lane and the adjacent
         # target lane is also occupied.  In that case we stop and wait
@@ -2420,6 +2423,9 @@ class Task3Controller:
         lane,
         obstacles
     ):
+        if NO_LANE_CHANGE:
+            return False
+
         if lane is None:
             self.target_lane_waiting = False
             return False
@@ -2527,6 +2533,7 @@ class Task3Controller:
             )
 
             self.lane_change_active = True
+            self.lane_change_frames = 0
 
             self.lane_change_stable = 0
             self.lane_change_progress = 0.0
@@ -2587,6 +2594,19 @@ class Task3Controller:
         lane
     ):
         if not self.lane_change_active:
+            return
+
+        self.lane_change_frames += 1
+
+        if self.lane_change_frames > LANE_CHANGE_MAX_FRAMES:
+            self.lane_offset_m = 0.0
+            self.lane_change_active = False
+            self.lane_change_stable = 0
+            self.lane_change_progress = 0.0
+            self.previous_lane_error = None
+            self.last_lane_change_frame = self.frame_count
+            print("[LANE CHANGE] ABORT: did not finish in %d frames; offset cleared"
+                  % LANE_CHANGE_MAX_FRAMES)
             return
 
         if lane is None:
@@ -2992,10 +3012,12 @@ class Task3Controller:
         # Stanley steering
         # --------------------------------------------------------------
 
-        longitudinal_speed = max(
-            speed * WHEEL_RADIUS,
-            0.05
+        ref_speed = (
+            OBSTACLE_NEAR_SPEED
+            if self.target_lane_waiting
+            else speed
         )
+        longitudinal_speed = max(ref_speed * WHEEL_RADIUS, 0.05)
 
         desired_delta = (
             psi
@@ -3030,6 +3052,18 @@ class Task3Controller:
                 STEER_LIMIT
             )
         )
+
+        if DEBUG_LOG_PATH and (self.lane_change_active or self.target_lane_waiting):
+            _debug_log(
+                "LC frame=%d active=%s wait=%s dir=%d offset=%.3f e_lane=%s e_total=%.3f psi=%.3f steer=%.1fdeg speed=%.2f reason=%s lc_frames=%d"
+                % (
+                    self.frame_count, self.lane_change_active, self.target_lane_waiting,
+                    self.lane_change_direction, self.lane_offset_m,
+                    None if lane is None else round(float(lane["e"]), 3),
+                    e, psi, math.degrees(self.last_steering), speed, reason,
+                    self.lane_change_frames,
+                )
+            )
 
         return (
             self.last_steering,
