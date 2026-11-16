@@ -67,16 +67,18 @@ PSI_GAIN = 0.5
 STEER_SMOOTH = 0.50
 MAX_LANE_MISSES = 8
 
-EASE_E_GAIN = 2.8
-EASE_PSI_GAIN = 0.55
-MIN_SPEED_FRACTION = 0.55
+EASE_E_GAIN = 2.2
+EASE_PSI_GAIN = 0.45
+MIN_SPEED_FRACTION = 0.65
 
 NORMAL_SPEED = 3.00
 SPEED_40_LIMIT = 1.18
 ABSOLUTE_SPEED_LIMIT = 3.00
 
-LANE_CHANGE_SPEED = 1.35
-OBSTACLE_NEAR_SPEED = 1.05
+# Slightly less conservative outside the restricted zone. The Speed 40
+# cap below still overrides every one of these speeds when the zone is active.
+LANE_CHANGE_SPEED = 1.65
+OBSTACLE_NEAR_SPEED = 1.25
 
 # Hospital
 HOSPITAL_TRIGGER_FRAMES = 2
@@ -106,7 +108,6 @@ OBSTACLE_TRACK_MATCH_PX = 65.0
 # Lane change
 LANE_CHANGE_DISTANCE_M = LANE_WIDTH_M
 LANE_CHANGE_TARGET_TOLERANCE_M = 0.095
-LANE_CHANGE_CROSSING_M = 0.18
 LANE_CHANGE_STABLE_FRAMES = 7
 LANE_CHANGE_FALLBACK_DIRECTION = +1
 LANE_CHANGE_REARM_FRAMES = 60
@@ -128,10 +129,12 @@ DEBUG_LOG_PATH = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "run.txt")
 ).strip()
 NO_LANE_CHANGE = os.environ.get("NV_NO_LANE_CHANGE", "0").strip() == "1"
-# If the 2nd Speed40 sign is missed, allow parking after this many
-# simulation seconds inside the zone (good run: zone lasted ~45 s).
-ZONE_FALLBACK_S = float(os.environ.get("NV_ZONE_FALLBACK_S", "50"))
+# An unverified lane change gets a bounded slow recovery period; if it
+# still cannot be verified, the controller stops without snapping back.
+LANE_CHANGE_RAMP_FRAMES = 18
 LANE_CHANGE_MAX_FRAMES = 120
+LANE_CHANGE_RECOVERY_FRAMES = 100
+LANE_CHANGE_RECOVERY_SPEED = 0.95
 
 _SIM_NOW = [0.0]
 _raw_print = print
@@ -363,11 +366,10 @@ def detect_signs_detailed(image):
         clipped_speed = (
             fill_ratio < 0.72
             and edge_clipped
-            and x >= int(width * 0.82)
-            and y <= int(height * 0.40)
             and 0.50 <= aspect <= 1.55
             and circularity >= 0.20
-            and 300.0 <= area <= frame_area * 0.05
+            and max(150.0, frame_area * 0.0005)
+                <= area <= frame_area * 0.05
         )
 
         if normal_ring or clipped_speed:
@@ -1997,7 +1999,6 @@ class Task3Controller:
         # Speed 40
         self.speed40_events = 0
         self.speed_zone = False
-        self.speed_zone_start = None
         self.now_s = 0.0
         self.speed_latched = False
         self.speed_seen_frames = 0
@@ -2029,6 +2030,10 @@ class Task3Controller:
 
         # lane_offset_m is ONLY a temporary lane-change target.
         self.lane_offset_m = 0.0
+        self.lane_change_target_m = 0.0
+        self.lane_change_ramp_progress = 0.0
+        self.lane_change_recovery = False
+        self.lane_change_faulted = False
         self.corner_bias_m = 0.0
         self.lane_change_active = False
         self.lane_change_direction = 0
@@ -2439,6 +2444,12 @@ class Task3Controller:
         if NO_LANE_CHANGE:
             return False
 
+        # After the bounded recovery window, a failed change keeps its target
+        # offset and holds the vehicle stopped. Never snap back into the old lane.
+        if self.lane_change_faulted:
+            self.target_lane_waiting = True
+            return False
+
         if lane is None:
             self.target_lane_waiting = False
             return False
@@ -2540,10 +2551,15 @@ class Task3Controller:
 
             self.lane_change_direction = direction
 
-            self.lane_offset_m = (
-                direction
-                * LANE_CHANGE_DISTANCE_M
+            # Ramp the lateral target in over several control frames rather
+            # than applying the full 0.40 m offset in one abrupt step.
+            self.lane_change_target_m = (
+                direction * LANE_CHANGE_DISTANCE_M
             )
+            self.lane_offset_m = 0.0
+            self.lane_change_ramp_progress = 0.0
+            self.lane_change_recovery = False
+            self.lane_change_faulted = False
 
             self.lane_change_active = True
             self.lane_change_frames = 0
@@ -2585,10 +2601,13 @@ class Task3Controller:
         # We only remove the temporary offset because the lane
         # detector should now be tracking the new lane.
         self.lane_offset_m = 0.0
+        self.lane_change_target_m = 0.0
+        self.lane_change_ramp_progress = 0.0
+        self.lane_change_recovery = False
+        self.lane_change_faulted = False
 
         self.lane_change_active = False
         self.lane_change_stable = 0
-        self.lane_change_progress = 0.0
         self.previous_lane_error = None
 
         self.completed_obstacle_avoids += 1
@@ -2606,28 +2625,53 @@ class Task3Controller:
         self,
         lane
     ):
-        if not self.lane_change_active:
+        if (
+            not self.lane_change_active
+            or self.lane_change_faulted
+        ):
             return
 
         self.lane_change_frames += 1
 
         if self.lane_change_frames > LANE_CHANGE_MAX_FRAMES:
-            self.lane_offset_m = 0.0
-            self.lane_change_active = False
-            self.lane_change_stable = 0
-            self.lane_change_progress = 0.0
-            self.previous_lane_error = None
-            self.last_lane_change_frame = self.frame_count
-            print("[LANE CHANGE] ABORT: did not finish in %d frames; offset cleared"
-                  % LANE_CHANGE_MAX_FRAMES)
-            return
+            # Continue the same target with a lower speed for a bounded
+            # recovery window. Never snap the offset back toward the obstacle.
+            if not self.lane_change_recovery:
+                self.lane_change_recovery = True
+                print(
+                    "[LANE CHANGE] recovery mode: target offset retained; "
+                    "slowing to %.2f rad/s"
+                    % LANE_CHANGE_RECOVERY_SPEED
+                )
+
+            if (
+                self.lane_change_frames
+                > LANE_CHANGE_MAX_FRAMES + LANE_CHANGE_RECOVERY_FRAMES
+            ):
+                self.lane_change_faulted = True
+                self.target_lane_waiting = True
+                self.last_lane_change_frame = self.frame_count
+                print(
+                    "[LANE CHANGE] FAIL-SAFE STOP: adjacent lane was not "
+                    "verified after recovery; target offset retained"
+                )
+                return
+
+        # Smoothstep ramp: zero initial/final slope avoids a steering step.
+        self.lane_change_ramp_progress = min(
+            1.0,
+            self.lane_change_frames / float(LANE_CHANGE_RAMP_FRAMES)
+        )
+        p = self.lane_change_ramp_progress
+        smooth_p = p * p * (3.0 - 2.0 * p)
+        self.lane_offset_m = (
+            self.lane_change_target_m * smooth_p
+        )
 
         if lane is None:
             return
 
-        direction = self.lane_change_direction
         current_error = float(lane["e"])
-
         previous_error = self.previous_lane_error
 
         jump = (
@@ -2636,96 +2680,53 @@ class Task3Controller:
             else current_error - previous_error
         )
 
-        # Lane tracker may switch suddenly to the adjacent lane.
+        # A sudden one-lane-width change means the lane tracker has adopted
+        # the adjacent lane; only then is it safe to remove the temporary bias.
         if jump is not None:
+            expected_jump = direction * LANE_WIDTH_M
             tracker_switch = (
-                abs(
-                    abs(jump)
-                    - LANE_WIDTH_M
-                )
-                <= 0.14
+                direction * jump > 0.0
+                and abs(jump - expected_jump) <= 0.14
             )
 
             if tracker_switch:
                 self._finish_lane_change(
-                    "lane tracker switched "
-                    "(jump=%+.3f m)" % jump
+                    "lane tracker switched (jump=%+.3f m)" % jump
                 )
                 return
 
-        # Fallback: observe lateral crossing.
-        progress = (
-            -direction
-            * current_error
-        )
-
-        self.lane_change_progress = max(
-            self.lane_change_progress,
-            progress
-        )
-
-        if (
-            self.lane_change_progress
-            >= LANE_CHANGE_CROSSING_M
-            and (
-                direction * current_error
-                > 0.0
-            )
-        ):
-            self._finish_lane_change(
-                "crossing detected"
-            )
-            return
-
-        # Fallback: target held stably.
+        # Require the vehicle to reach the FULL adjacent-lane target. Compare
+        # against the final target, not the currently ramped offset, otherwise
+        # the controller could declare success halfway through the manoeuvre.
         target_error = (
-            current_error
-            + self.lane_offset_m
+            current_error + self.lane_change_target_m
         )
 
-        if (
-            abs(target_error)
-            <= LANE_CHANGE_TARGET_TOLERANCE_M
-        ):
+        if abs(target_error) <= LANE_CHANGE_TARGET_TOLERANCE_M:
             self.lane_change_stable += 1
         else:
             self.lane_change_stable = 0
 
-        if (
-            self.lane_change_stable
-            >= LANE_CHANGE_STABLE_FRAMES
-        ):
+        if self.lane_change_stable >= LANE_CHANGE_STABLE_FRAMES:
             self._finish_lane_change(
                 "adjacent lane target stable"
             )
             return
 
-        self.previous_lane_error = (
-            current_error
-        )
+        self.previous_lane_error = current_error
 
     # ------------------------------------------------------------------
     # Parking
     # ------------------------------------------------------------------
 
     def _prerequisites_complete(self):
-        if not self.hospital_done:
-            return False
-
-        if self.speed40_events >= 2 and not self.speed_zone:
-            return True
-
-        # Fallback: second Speed40 sign was missed, but we have been in
-        # the restricted zone long enough that the exit must have passed.
-        if (
-            self.speed40_events >= 1
-            and self.speed_zone
-            and self.speed_zone_start is not None
-            and (self.now_s - self.speed_zone_start) >= ZONE_FALLBACK_S
-        ):
-            return True
-
-        return False
+        # Parking is enabled only after the Hospital stop is complete and
+        # the second distinct Speed40 sign confirms the zone exit.
+        return (
+            self.hospital_done
+            and self.speed40_events >= 2
+            and not self.speed_zone
+        )
 
     # ------------------------------------------------------------------
     # Main step
@@ -2745,10 +2746,6 @@ class Task3Controller:
         self.now_s = now
         self._update_hospital_detection(signs)
         self._update_speed_zone(signs)
-        if self.speed_zone and self.speed_zone_start is None:
-            self.speed_zone_start = now
-        elif not self.speed_zone:
-            self.speed_zone_start = None
 
         self.obstacle_tracker.update(
             obstacles,
@@ -2811,9 +2808,17 @@ class Task3Controller:
                 )
             )
 
+            # Keep the Speed 40 limit invariant across every controller mode.
+            if self.speed_zone:
+                speed = min(float(speed), SPEED_40_LIMIT)
+
             self.last_steering = steering
             self.done = parked
-            self.cap_reason = "parking"
+            self.cap_reason = (
+                "parking_speed_zone"
+                if self.speed_zone
+                else "parking"
+            )
 
             return steering, speed
 
@@ -2929,9 +2934,16 @@ class Task3Controller:
                 )
             )
 
+            if self.speed_zone:
+                speed = min(float(speed), SPEED_40_LIMIT)
+
             self.last_steering = steering
             self.done = parked
-            self.cap_reason = "parking"
+            self.cap_reason = (
+                "parking_speed_zone"
+                if self.speed_zone
+                else "parking"
+            )
 
             return steering, speed
 
@@ -3030,13 +3042,21 @@ class Task3Controller:
             speed = HOSPITAL_APPROACH_SPEED
             reason = "hospital_approach"
 
-        # Lane change
-        if (
-            self.lane_change_active
-            and speed > LANE_CHANGE_SPEED
-        ):
-            speed = LANE_CHANGE_SPEED
-            reason = "lane_change"
+        # Lane change. Once the normal window expires, keep steering toward
+        # the same target but reduce speed for a bounded recovery period.
+        if self.lane_change_active:
+            lane_change_limit = (
+                LANE_CHANGE_RECOVERY_SPEED
+                if self.lane_change_recovery
+                else LANE_CHANGE_SPEED
+            )
+            if speed > lane_change_limit:
+                speed = lane_change_limit
+                reason = (
+                    "lane_change_recovery"
+                    if self.lane_change_recovery
+                    else "lane_change"
+                )
 
         # Obstacle proximity
         if (
