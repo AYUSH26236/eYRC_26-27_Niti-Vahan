@@ -2683,9 +2683,9 @@ class Task3Controller:
         # A sudden one-lane-width change means the lane tracker has adopted
         # the adjacent lane; only then is it safe to remove the temporary bias.
         if jump is not None:
-            expected_jump = direction * LANE_WIDTH_M
+            expected_jump = self.lane_change_direction * LANE_WIDTH_M
             tracker_switch = (
-                direction * jump > 0.0
+                self.lane_change_direction * jump > 0.0
                 and abs(jump - expected_jump) <= 0.14
             )
 
