@@ -2863,6 +2863,40 @@ class Task3Controller:
             )
         )
 
+        if self._prerequisites_complete():
+            if marker_visible:
+                if not getattr(self, "_marker_seen_once", False):
+                    self._marker_seen_once = True
+                    print(
+                        "[PARKING] prerequisites met; marker %s first seen "
+                        "(streak=%d path_clear=%s lane_change=%s)"
+                        % (
+                            marker_id,
+                            self.parking_marker_streak,
+                            path_clear,
+                            self.lane_change_active,
+                        )
+                    )
+                if DEBUG_LOG_PATH:
+                    _debug_log(
+                        "PARK-WAIT f=%d id=%s streak=%d path_clear=%s "
+                        "lane_change=%s"
+                        % (
+                            self.frame_count,
+                            marker_id,
+                            self.parking_marker_streak,
+                            path_clear,
+                            self.lane_change_active,
+                        )
+                    )
+            elif not getattr(self, "_prereq_announced", False):
+                self._prereq_announced = True
+                print(
+                    "[PARKING] prerequisites met (speed40=%d zone=%s); "
+                    "searching for ArUco marker"
+                    % (self.speed40_events, self.speed_zone)
+                )
+
         if (
             self._prerequisites_complete()
             and marker_visible
