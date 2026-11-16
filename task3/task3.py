@@ -124,7 +124,10 @@ SIGN_DEBUG = (
 )
 
 DEBUG_LOG_PATH = os.environ.get("NV_DEBUG_LOG", "").strip()
-NO_LANE_CHANGE = os.environ.get("NV_NO_LANE_CHANGE", "1").strip() == "1"
+NO_LANE_CHANGE = os.environ.get("NV_NO_LANE_CHANGE", "0").strip() == "1"
+# If the 2nd Speed40 sign is missed, allow parking after this many
+# simulation seconds inside the zone (good run: zone lasted ~45 s).
+ZONE_FALLBACK_S = float(os.environ.get("NV_ZONE_FALLBACK_S", "50"))
 LANE_CHANGE_MAX_FRAMES = 120
 
 _SIM_NOW = [0.0]
@@ -1991,6 +1994,8 @@ class Task3Controller:
         # Speed 40
         self.speed40_events = 0
         self.speed_zone = False
+        self.speed_zone_start = None
+        self.now_s = 0.0
         self.speed_latched = False
         self.speed_seen_frames = 0
         self.speed_absent_frames = 0
@@ -2059,6 +2064,11 @@ class Task3Controller:
                 and sign["area"] >= SPEED_SIGN_MIN_AREA
             )
         ]
+
+        if DEBUG_LOG_PATH and signs:
+            _debug_log("SIGNS f=%d speed_events=%d zone=%s %s" % (
+                self.frame_count, self.speed40_events, self.speed_zone,
+                [(s["label"], s["bbox"], s["area"]) for s in signs]))
 
         if visible:
             self.speed_absent_frames = 0
@@ -2696,11 +2706,23 @@ class Task3Controller:
     # ------------------------------------------------------------------
 
     def _prerequisites_complete(self):
-        return (
-            self.hospital_done
-            and self.speed40_events >= 2
-            and not self.speed_zone
-        )
+        if not self.hospital_done:
+            return False
+
+        if self.speed40_events >= 2 and not self.speed_zone:
+            return True
+
+        # Fallback: second Speed40 sign was missed, but we have been in
+        # the restricted zone long enough that the exit must have passed.
+        if (
+            self.speed40_events >= 1
+            and self.speed_zone
+            and self.speed_zone_start is not None
+            and (self.now_s - self.speed_zone_start) >= ZONE_FALLBACK_S
+        ):
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Main step
@@ -2717,8 +2739,13 @@ class Task3Controller:
         obstacles = detect_obstacles_detailed(frame)
         lane = detect_lane(frame)
 
+        self.now_s = now
         self._update_hospital_detection(signs)
         self._update_speed_zone(signs)
+        if self.speed_zone and self.speed_zone_start is None:
+            self.speed_zone_start = now
+        elif not self.speed_zone:
+            self.speed_zone_start = None
 
         self.obstacle_tracker.update(
             obstacles,
