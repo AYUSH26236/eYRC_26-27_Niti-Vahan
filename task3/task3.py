@@ -123,7 +123,10 @@ SIGN_DEBUG = (
     os.environ.get("NV_DEBUG_SIGNS", "0").strip() == "1"
 )
 
-DEBUG_LOG_PATH = os.environ.get("NV_DEBUG_LOG", "run.txt").strip()
+DEBUG_LOG_PATH = os.environ.get(
+    "NV_DEBUG_LOG",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "run.txt")
+).strip()
 NO_LANE_CHANGE = os.environ.get("NV_NO_LANE_CHANGE", "0").strip() == "1"
 # If the 2nd Speed40 sign is missed, allow parking after this many
 # simulation seconds inside the zone (good run: zone lasted ~45 s).
@@ -3141,6 +3144,9 @@ def main():
         "Niti Vahan Task 3 - Team %s"
         % TEAM_ID
     )
+
+    if DEBUG_LOG_PATH:
+        print("[DEBUG] writing log to: %s" % DEBUG_LOG_PATH)
 
     print(
         "Waiting for the evaluation tool "
