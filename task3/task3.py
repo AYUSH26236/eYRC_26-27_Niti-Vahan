@@ -123,7 +123,7 @@ SIGN_DEBUG = (
     os.environ.get("NV_DEBUG_SIGNS", "0").strip() == "1"
 )
 
-DEBUG_LOG_PATH = os.environ.get("NV_DEBUG_LOG", "").strip()
+DEBUG_LOG_PATH = os.environ.get("NV_DEBUG_LOG", "run.txt").strip()
 NO_LANE_CHANGE = os.environ.get("NV_NO_LANE_CHANGE", "0").strip() == "1"
 # If the 2nd Speed40 sign is missed, allow parking after this many
 # simulation seconds inside the zone (good run: zone lasted ~45 s).
