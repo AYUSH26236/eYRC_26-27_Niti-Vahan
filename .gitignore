@@ -3,3 +3,4 @@ __MACOSX/
 __pycache__/
 *.pyc
 probe_log.txt
+/vehicle-test-runs/

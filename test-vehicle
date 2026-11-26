@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+skills="$root/.agents/skills"
+py=${VEHICLE_PYTHON:-python3}
+case "${1:-sim}" in
+    sim)
+        if [ "$#" -gt 0 ]; then shift; fi
+        exec "$py" -B "$skills/coppeliasim-test-runner/scripts/run_scene.py" \
+            "$root/tools/vehicle_tests/task1b.py" --output "$root/vehicle-test-runs/sim" "$@" ;;
+    steering) shift; exec "$py" -B "$skills/steering-path-debugger/scripts/diagnose.py" "$@" ;;
+    vision) shift; exec "$py" -B "$skills/camera-lane-debugger/scripts/replay.py" "$@" ;;
+    *) echo 'Usage: ./test-vehicle [sim|steering|vision] [options]' >&2; exit 2 ;;
+esac
