@@ -291,6 +291,18 @@ def _rectify_sign(image, contour):
     )
 
 
+def _has_hospital_glyph(glyph):
+    # The rectified sign is 64 x 64. The white H has two vertical stems
+    # and a crossbar, with blue gaps above and below the crossbar.
+    crossbar = glyph[28:36, 28:36].mean()
+    for band in (glyph[16:24], glyph[40:48]):
+        gap = band[:, 28:36].mean()
+        weaker_stem = min(band[:, 16:25].mean(), band[:, 39:48].mean())
+        if min(crossbar, weaker_stem) - gap < 0.20:
+            return False
+    return True
+
+
 def detect_signs_detailed(image):
     detections = []
 
@@ -504,11 +516,12 @@ def detect_signs_detailed(image):
 
                 child = hierarchy[child][0]
 
-            label = (
-                "Parking"
-                if (p_like or depth >= 2 or clipped)
-                else "Hospital"
-            )
+            if p_like or depth >= 2 or clipped:
+                label = "Parking"
+            elif _has_hospital_glyph(glyph):
+                label = "Hospital"
+            else:
+                continue
 
             if SIGN_DEBUG:
                 print(
@@ -3202,6 +3215,8 @@ def main():
 
     frames = 0
     parked_settle_start = None
+    last_frame_time = None
+    exit_code = 1
 
     time_by_reason = {}
     prev_now = float(sim.getSimulationTime())
@@ -3228,12 +3243,18 @@ def main():
                     now - parked_settle_start
                     >= PARK_FINAL_SETTLE_SECONDS
                 ):
+                    exit_code = 0
                     print(
                         "[DONE] Final stop hold complete; "
                         "exiting controller."
                     )
                     break
 
+                time.sleep(0.001)
+                continue
+
+            # Count each simulation update once in the visual confirmation streaks.
+            if now == last_frame_time:
                 time.sleep(0.001)
                 continue
 
@@ -3266,6 +3287,7 @@ def main():
                     % (frame_w, frame_h)
                 )
 
+            last_frame_time = now
             frames += 1
 
             steering, speed = controller.step(
@@ -3322,6 +3344,7 @@ def main():
                 )
 
     except KeyboardInterrupt:
+        exit_code = 130
         print(
             "Interrupted by user."
         )
@@ -3379,7 +3402,9 @@ def main():
         )
     )
 
-    return 0
+    if exit_code == 1:
+        print("Run incomplete: final parking hold was not verified.")
+    return exit_code
 
 
 if __name__ == "__main__":
