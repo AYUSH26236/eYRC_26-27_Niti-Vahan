@@ -1,0 +1,4 @@
+interface:
+  display_name: "Steering and Path-Tracking Debugger"
+  short_description: "Trace wheel commands, joint feedback, and lane overshoot"
+  default_prompt: "Use $steering-path-debugger to diagnose the first steering discrepancy in this run."

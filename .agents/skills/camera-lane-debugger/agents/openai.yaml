@@ -1,0 +1,4 @@
+interface:
+  display_name: "Camera and Lane-Detection Debugger"
+  short_description: "Replay lane clips and inspect the first suspect frame"
+  default_prompt: "Use $camera-lane-debugger to replay the clips and locate the first lane detection error."

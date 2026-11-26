@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hardware Fault Diagnosis"
+  short_description: "Trace robot faults through wiring, firmware, and feedback"
+  default_prompt: "Use $hardware-fault-diagnosis to trace this symptom against my wiring and measured steering."

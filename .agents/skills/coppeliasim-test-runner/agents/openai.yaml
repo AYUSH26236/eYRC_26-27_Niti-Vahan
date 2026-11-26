@@ -1,0 +1,4 @@
+interface:
+  display_name: "CoppeliaSim Test Runner"
+  short_description: "Replay a vehicle controller and check its recorded path"
+  default_prompt: "Use $coppeliasim-test-runner to run my controller on a copy of the scene and check the vehicle path."
